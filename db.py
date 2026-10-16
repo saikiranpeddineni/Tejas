@@ -111,24 +111,41 @@ CREATE TABLE IF NOT EXISTS portfolio_snapshots (
 
 def init_db() -> None:
     Path(Config.DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(Config.DB_PATH)
+    conn = sqlite3.connect(Config.DB_PATH, timeout=20)
     try:
         conn.executescript(_SCHEMA)
         # ── Migrations (additive only) ────────────────────────────────────────
         # trades.highest_price: persists the trailing-stop high-water mark so a
         # restart doesn't silently disarm profit protection on open positions.
         cols = {r[1] for r in conn.execute("PRAGMA table_info(trades)")}
-        if "highest_price" not in cols:
-            conn.execute("ALTER TABLE trades ADD COLUMN highest_price REAL DEFAULT 0")
+
+        def add_column(name: str, definition: str) -> bool:
+            if name in cols:
+                return False
+            try:
+                conn.execute(f"ALTER TABLE trades ADD COLUMN {definition}")
+                cols.add(name)
+                return True
+            except sqlite3.OperationalError as exc:
+                # Two startup paths (bot + dashboard/trainer) can initialize the
+                # same DB concurrently.  If the other path won the migration
+                # race, its committed column is already the desired state.
+                if "duplicate column name" in str(exc).lower():
+                    cols.add(name)
+                    return False
+                raise
+
+        if add_column("highest_price", "highest_price REAL DEFAULT 0"):
             log.info("[DB] migrated: trades.highest_price added")
-        # Staged exits: shares/price of the first-target trim.
-        if "trim_shares" not in cols:
-            conn.execute("ALTER TABLE trades ADD COLUMN trim_shares REAL DEFAULT 0")
-            conn.execute("ALTER TABLE trades ADD COLUMN trim_price REAL")
-            log.info("[DB] migrated: trades.trim_shares/trim_price added")
+        # Staged exits: shares/price of the first-target trim.  Check the two
+        # columns independently so a process killed between ALTER TABLE
+        # statements is recoverable on the next start.
+        if add_column("trim_shares", "trim_shares REAL DEFAULT 0"):
+            log.info("[DB] migrated: trades.trim_shares added")
+        if add_column("trim_price", "trim_price REAL"):
+            log.info("[DB] migrated: trades.trim_price added")
         # Per-trade entry rationale (the WHY, shown in Telegram + dashboard).
-        if "rationale" not in cols:
-            conn.execute("ALTER TABLE trades ADD COLUMN rationale TEXT DEFAULT ''")
+        if add_column("rationale", "rationale TEXT DEFAULT ''"):
             log.info("[DB] migrated: trades.rationale added")
         conn.commit()
         log.info(f"✓ DB ready: {Config.DB_PATH}")

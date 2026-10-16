@@ -18,6 +18,7 @@ Usage:
 import argparse
 import json
 import logging
+import math
 import sys
 
 import numpy as np
@@ -45,39 +46,48 @@ def eval_ml_holdout(lookback_days: int = 90) -> dict:
     cutoff = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
     rows = db.fetchall(
         "SELECT features_json, outcome, entry_time FROM training_data "
-        "WHERE outcome IS NOT NULL AND entry_time >= ? ORDER BY entry_time ASC",
+        "WHERE outcome IS NOT NULL AND entry_time IS NOT NULL "
+        "AND julianday(entry_time) IS NOT NULL "
+        "AND julianday(entry_time) >= julianday(?) ORDER BY julianday(entry_time) ASC",
         (cutoff,),
     )
-
-    if len(rows) < 30:
-        log.warning(f"Only {len(rows)} resolved trades — need 30+ for meaningful eval")
-        return {"error": "insufficient_data", "n": len(rows)}
 
     X, y = [], []
     for row in rows:
         try:
             feat = json.loads(row["features_json"])
-            X.append([feat.get(n, 0.0) for n in FEATURE_NAMES])
-            y.append(int(row["outcome"]))
-        except Exception:
+            if not isinstance(feat, dict):
+                continue
+            values = [float(feat.get(n, 0.0)) for n in FEATURE_NAMES]
+            outcome = int(row["outcome"])
+            if outcome not in (0, 1) or not all(math.isfinite(v) for v in values):
+                continue
+            X.append(values)
+            y.append(outcome)
+        except (TypeError, ValueError, json.JSONDecodeError):
             continue
 
-    X = np.array(X, dtype=np.float32)
-    y = np.array(y, dtype=np.int32)
+    if len(X) < 30:
+        log.warning(f"Only {len(X)} valid resolved trades — need 30+ for meaningful eval")
+        return {"error": "insufficient_data", "n": len(X)}
+
+    X = np.asarray(X, dtype=np.float32)
+    y = np.asarray(y, dtype=np.int32)
 
     split = int(len(X) * 0.80)
     X_tr, X_te = X[:split], X[split:]
     y_tr, y_te = y[:split], y[split:]
 
-    if len(np.unique(y_te)) < 2:
-        return {"error": "single_class_test"}
+    if len(np.unique(y_tr)) < 2 or len(np.unique(y_te)) < 2:
+        return {"error": "single_class_split"}
 
     dtr = lgb.Dataset(X_tr, y_tr, feature_name=FEATURE_NAMES)
     dte = lgb.Dataset(X_te, y_te, reference=dtr)
+    # The test fold is for scoring only.  Early stopping against it tunes the
+    # round count on the labels being reported and leaks holdout information.
     b = lgb.train(
         _LGB_PARAMS, dtr, num_boost_round=300,
-        valid_sets=[dte],
-        callbacks=[lgb.early_stopping(30, verbose=False), lgb.log_evaluation(0)],
+        callbacks=[lgb.log_evaluation(0)],
     )
 
     preds = b.predict(X_te)
@@ -105,17 +115,36 @@ def simulate_trades(lookback_days: int = 90) -> dict:
     from datetime import datetime, timezone, timedelta
     cutoff = (datetime.now(timezone.utc) - timedelta(days=lookback_days)).isoformat()
     rows = db.fetchall(
-        "SELECT * FROM trades WHERE status='closed' AND entry_time >= ? ORDER BY entry_time ASC",
+        "SELECT * FROM trades WHERE status='closed' AND entry_time IS NOT NULL "
+        "AND pnl_usd IS NOT NULL AND pnl_pct IS NOT NULL "
+        "AND julianday(entry_time) IS NOT NULL "
+        "AND julianday(entry_time) >= julianday(?) ORDER BY julianday(entry_time) ASC",
         (cutoff,),
     )
+    valid_rows = []
+    for row in rows:
+        try:
+            if (math.isfinite(float(row["pnl_pct"]))
+                    and math.isfinite(float(row["pnl_usd"]))):
+                valid_rows.append(row)
+        except (TypeError, ValueError):
+            continue
+    rows = valid_rows
     if not rows:
-        log.warning("No resolved trades in window")
+        log.warning("No valid resolved trades in window")
         return {}
 
     all_pnl_pct = [float(r["pnl_pct"]) for r in rows]
     all_pnl_usd = [float(r["pnl_usd"]) for r in rows]
 
-    filt = [r for r in rows if (r["entry_quality"] or 0) >= Config.MIN_ENTRY_QUALITY]
+    filt = []
+    for row in rows:
+        try:
+            quality = float(row["entry_quality"] or 0)
+            if math.isfinite(quality) and quality >= Config.MIN_ENTRY_QUALITY:
+                filt.append(row)
+        except (TypeError, ValueError):
+            continue
     f_pct = [float(r["pnl_pct"]) for r in filt]
     f_usd = [float(r["pnl_usd"]) for r in filt]
 
@@ -125,7 +154,7 @@ def simulate_trades(lookback_days: int = 90) -> dict:
         arr = np.array(pnl_pct)
         wins = sum(p > 0 for p in pnl_usd)
         wr   = wins / len(pnl_usd)
-        mean = float(np.mean(arr)); std = float(np.std(arr, ddof=1))
+        mean = float(np.mean(arr)); std = float(np.std(arr, ddof=1)) if len(arr) > 1 else 0.0
         sharpe = mean / std * np.sqrt(252) if std > 0 else 0.0
         total  = sum(pnl_usd)
         cumul  = np.cumsum(pnl_usd)
@@ -183,7 +212,8 @@ def main():
         if ml_result.get("top_features"):
             print("\n  Top ML Features:")
             for name, imp in ml_result["top_features"][:6]:
-                bar = "█" * int(imp / max(v for _,v in ml_result["top_features"]) * 20)
+                max_imp = max((v for _, v in ml_result["top_features"]), default=0.0)
+                bar = "█" * int(imp / max_imp * 20) if max_imp > 0 else ""
                 print(f"    {name:25s} {bar}")
     print()
 

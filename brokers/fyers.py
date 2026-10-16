@@ -52,7 +52,7 @@ class FyersBroker(LiveBrokerBase):
                 break
         return {"cash": cash, "buying_power": cash, "portfolio_value": cash, "currency": "INR"}
 
-    def _place_entry(self, symbol, side, qty) -> Optional[dict]:
+    def _place_entry(self, symbol, side, qty, client_order_id: str = "") -> Optional[dict]:
         data = self._post(f"{BASE}/orders/sync", json={
             "symbol": self._fy(symbol), "qty": int(qty), "type": 2,  # 2 = market
             "side": 1 if side.lower() == "buy" else -1,
@@ -62,10 +62,11 @@ class FyersBroker(LiveBrokerBase):
         return {"id": data.get("id", ""), "symbol": symbol, "qty": qty}
 
     def _flatten(self, symbol) -> Optional[dict]:
-        pos = self.get_position(symbol)
-        if not pos or int(pos.get("qty", 0)) == 0:
+        pos = self._get_position_strict(symbol)
+        qty = int(float(pos.get("qty", 0) or 0)) if pos else 0
+        if qty == 0:
             return {"symbol": symbol, "qty": 0}
-        return self._place_entry(symbol, "sell", abs(int(pos["qty"])))
+        return self._place_entry(symbol, "sell" if qty > 0 else "buy", abs(qty))
 
     def _positions(self) -> List[dict]:
         data = self._get(f"{BASE}/positions").get("netPositions", []) or []

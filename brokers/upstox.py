@@ -65,20 +65,24 @@ class UpstoxBroker(LiveBrokerBase):
         cash = float(eq.get("available_margin", 0) or 0)
         return {"cash": cash, "buying_power": cash, "portfolio_value": cash, "currency": "INR"}
 
-    def _place_entry(self, symbol, side, qty) -> Optional[dict]:
-        data = self._post(f"{BASE}/order/place", json={
+    def _place_entry(self, symbol, side, qty, client_order_id: str = "") -> Optional[dict]:
+        payload = {
             "quantity": int(qty), "product": self.product, "validity": "DAY",
             "price": 0, "instrument_token": self._ikey(symbol),
             "order_type": "MARKET", "transaction_type": side.upper(),
             "disclosed_quantity": 0, "trigger_price": 0, "is_amo": False,
-        }).get("data", {})
+        }
+        if client_order_id:
+            payload["tag"] = client_order_id
+        data = self._post(f"{BASE}/order/place", json=payload).get("data", {})
         return {"id": data.get("order_id", ""), "symbol": symbol, "qty": qty}
 
     def _flatten(self, symbol) -> Optional[dict]:
-        pos = self.get_position(symbol)
-        if not pos or int(pos.get("qty", 0)) == 0:
+        pos = self._get_position_strict(symbol)
+        qty = int(float(pos.get("qty", 0) or 0)) if pos else 0
+        if qty == 0:
             return {"symbol": symbol, "qty": 0}
-        return self._place_entry(symbol, "sell", abs(int(pos["qty"])))
+        return self._place_entry(symbol, "sell" if qty > 0 else "buy", abs(qty))
 
     def _positions(self) -> List[dict]:
         data = self._get(f"{BASE}/portfolio/short-term-positions").get("data", [])

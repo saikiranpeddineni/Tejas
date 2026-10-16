@@ -55,12 +55,32 @@ def main() -> None:
     # yourself at http://127.0.0.1:8765 when you want to view it.
     env = dict(os.environ)
     env["TEJAS_NO_BROWSER"] = "1"
-    subprocess.Popen(
-        [_python_gui(), os.path.join(BASE_DIR, "webui.py")],
-        cwd=BASE_DIR, env=env,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        creationflags=flags,
-    )
+    startup_log_path = os.path.join(BASE_DIR, "tejas.startup.log")
+    try:
+        # Keep import/bind failures diagnosable when Task Scheduler launches us
+        # without a console.  The file is ignored as runtime state and does not
+        # contain broker credentials; cap it so a crash loop cannot fill disk.
+        if os.path.exists(startup_log_path) and os.path.getsize(startup_log_path) > 1024 * 1024:
+            with open(startup_log_path, "wb"):
+                pass
+        startup_log = open(startup_log_path, "ab")
+        try:
+            subprocess.Popen(
+                [_python_gui(), os.path.join(BASE_DIR, "webui.py")],
+                cwd=BASE_DIR, env=env,
+                stdout=subprocess.DEVNULL, stderr=startup_log,
+                creationflags=flags,
+            )
+        finally:
+            startup_log.close()
+    except OSError:
+        # A transient launch failure is retried by the next scheduled watchdog
+        # invocation; leave a concise diagnostic without dumping environment data.
+        try:
+            with open(startup_log_path, "ab") as f:
+                f.write(b"watchdog: failed to launch dashboard\n")
+        except OSError:
+            pass
 
 
 if __name__ == "__main__":

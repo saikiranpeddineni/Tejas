@@ -7,7 +7,8 @@ FeatureVector has 34 fields (22 base + 12 gold).
 The old monkey-patch approach has been replaced with a clean dataclass.
 """
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
+import math
 from typing import Dict, List, Optional
 
 
@@ -173,7 +174,7 @@ class Signal:
     features:     FeatureVector
     stop_loss:    float
     take_profit:  float
-    generated_at: datetime = field(default_factory=datetime.utcnow)
+    generated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     # ── Analyst reasoning (for transparency / UI) ────────────────────────────
     analyst_score: float = 0.0          # composite [-1,+1]
     thesis:        str   = ""           # human-readable rationale
@@ -200,7 +201,7 @@ class Trade:
     kelly_pct:         float
     features:          FeatureVector
     alpaca_order_id:   str = ""
-    entry_time:        datetime = field(default_factory=datetime.utcnow)
+    entry_time:        datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     status:            str = "open"
     pnl_usd:           float = 0.0
     pnl_pct:           float = 0.0
@@ -229,6 +230,11 @@ class Portfolio:
 
     @property
     def drawdown(self) -> float:
+        # Corrupt/non-finite account state must never make the safety halt
+        # disappear through NaN arithmetic. Treat it as a full drawdown so the
+        # caller fails closed and does not approve new risk.
+        if not math.isfinite(self.peak_bankroll) or not math.isfinite(self.bankroll):
+            return 1.0
         if self.peak_bankroll <= 0:
             return 0.0
         return max(0.0, (self.peak_bankroll - self.bankroll) / self.peak_bankroll)

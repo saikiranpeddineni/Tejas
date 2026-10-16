@@ -10,7 +10,12 @@ KEY FIXES in this version:
 import os
 from pathlib import Path
 from dotenv import load_dotenv
-load_dotenv()
+
+# Resolve configuration relative to this module, not the caller's current
+# directory.  This prevents an unrelated parent-directory .env from silently
+# supplying broker credentials when Tejas is launched by a scheduler/container.
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(dotenv_path=BASE_DIR / ".env")
 
 # ★ Trust the OS (Windows) certificate store, not just certifi's bundle. A
 # corporate VPN/proxy that intercepts TLS (e.g. Zscaler) re-signs every HTTPS
@@ -24,7 +29,12 @@ try:
 except ImportError:
     pass   # optional dependency — without it, behavior is unchanged
 
-BASE_DIR = Path(__file__).parent
+# Keep the paper/live flag aligned with brokers.factory.  Unknown broker names
+# deliberately fall back to the simulated adapter there; they must not be
+# labelled LIVE merely because DRY_RUN was set false.
+_LIVE_BROKERS = frozenset({
+    "zerodha", "upstox", "angelone", "angel", "smartapi", "dhan", "fyers",
+})
 
 
 class Config:
@@ -33,8 +43,8 @@ class Config:
     BROKER  = os.getenv("BROKER", "simulated").lower()
     # Holding type: DELIVERY (multi-day, recommended) or INTRADAY (auto square-off)
     PRODUCT = os.getenv("PRODUCT", "DELIVERY").upper()
-    # PAPER = simulated broker OR DRY_RUN on (no real orders hit an exchange)
-    PAPER_TRADING = (BROKER == "simulated") or os.getenv("DRY_RUN", "true").lower() == "true"
+    # PAPER = simulated/unknown fallback broker OR DRY_RUN on (no real orders)
+    PAPER_TRADING = (BROKER not in _LIVE_BROKERS) or os.getenv("DRY_RUN", "true").lower() == "true"
 
     # Index symbols used for regime/VIX/benchmark (logical names; data layer maps
     # them — e.g. Yahoo: NIFTY->^NSEI, INDIAVIX->^INDIAVIX)
@@ -161,7 +171,7 @@ class Config:
     STOP_MIN_PCT       = 0.020
     STOP_MAX_PCT       = 0.040
     TAKE_PROFIT_RR     = 2.5
-    TRAILING_STOP_PCT  = float(os.getenv("TRAILING_STOP_PCT", "0.02"))  # ★ was missing
+    TRAILING_STOP_PCT  = float(os.getenv("TRAILING_STOP_PCT", "0.04"))  # ★ relaxed to 4%
     STOP_LOSS_PCT      = float(os.getenv("STOP_LOSS_PCT",   "0.03"))
     TAKE_PROFIT_PCT    = float(os.getenv("TAKE_PROFIT_PCT", "0.07"))
 
@@ -170,7 +180,7 @@ class Config:
 
     # ── Exit Triggers ─────────────────────────────────────────────────────────
     PROB_DROP_THRESHOLD = 0.18
-    TIME_DECAY_HOURS    = 36
+    TIME_DECAY_HOURS    = 120
 
     # ── ★ Churn control / hold discipline ──────────────────────────────────────
     # The model forecasts a 5-day forward return, so intraday flip-flop exits are
@@ -278,8 +288,10 @@ class Config:
     OVERFIT_AUC_DELTA   = 0.08
 
     # ── Trading Hours ─────────────────────────────────────────────────────────
+    EOD_EXECUTION_ONLY        = True
+    EOD_EXECUTION_WINDOW_MINS = 60
     TRADE_AFTER_OPEN_MIN   = 20
-    TRADE_BEFORE_CLOSE_MIN = 35
+    TRADE_BEFORE_CLOSE_MIN = 5
 
     # ── Cache ──────────────────────────────────────────────────────────────────
     QUOTE_CACHE_TTL   = 5

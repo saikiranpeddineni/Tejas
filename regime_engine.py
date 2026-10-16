@@ -79,6 +79,9 @@ class RegimeEngine:
             spy_bars = self.broker.get_bars(Config.MARKET_INDEX_SYMBOL, "1Day", limit=30)
             if spy_bars and len(spy_bars) >= 10:
                 closes = np.array([b.close for b in spy_bars], dtype=float)
+                closes = closes[np.isfinite(closes) & (closes > 0)]
+                if len(closes) < 10:
+                    raise ValueError("insufficient finite index closes")
                 rets   = np.diff(np.log(closes))
 
                 # 10-day: responsive to recent moves
@@ -92,7 +95,7 @@ class RegimeEngine:
                     vol_21 = vol_10
 
                 vix = vol_10 * 0.60 + vol_21 * 0.40
-                return float(np.clip(vix, 10.0, 80.0))
+                return float(np.clip(vix, 10.0, 80.0)) if np.isfinite(vix) else 20.0
         except Exception:
             pass
 
@@ -118,6 +121,9 @@ class RegimeEngine:
                 return "range"
 
             closes       = np.array([b.close for b in bars], dtype=float)
+            closes       = closes[np.isfinite(closes) & (closes > 0)]
+            if len(closes) < 60:
+                return "range"
             price        = float(closes[-1])
             ma50         = float(np.mean(closes[-50:]))
             ma200        = float(np.mean(closes[-200:])) if len(closes) >= 200 else float(np.mean(closes))

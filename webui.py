@@ -11,7 +11,10 @@ Stdlib only (no extra dependency). Launch with the "Start Tejas" shortcut or
 
 Default settings are paper-safe (simulated broker, fake money, no API key).
 """
+import base64
+import hmac
 import json
+import math
 import os
 import re
 import sqlite3
@@ -23,7 +26,7 @@ import urllib.request
 import webbrowser
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 import socket
 
@@ -36,8 +39,18 @@ log = logging.getLogger("webui")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 LOG_PATH = os.path.join(BASE_DIR, "tejas.log")
 DB_PATH  = os.path.join(BASE_DIR, "tejas.db")
-# Bind on all interfaces so a phone on the SAME Wi-Fi can open it too.
-HOST, PORT = "0.0.0.0", 8765
+# The dashboard can start/stop the trader and save broker credentials, so it
+# must not be reachable from the network by default.  Opt into a remote bind
+# only together with TEJAS_UI_TOKEN (HTTP Basic auth; see README.md).
+HOST = os.environ.get("TEJAS_UI_HOST", "127.0.0.1").strip() or "127.0.0.1"
+PORT = 8765
+UI_TOKEN = os.environ.get("TEJAS_UI_TOKEN", "").strip()
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+if HOST not in _LOOPBACK_HOSTS and not UI_TOKEN:
+    raise SystemExit(
+        "Refusing to expose the Tejas dashboard without TEJAS_UI_TOKEN; "
+        "use the default loopback bind or configure a token."
+    )
 
 
 def lan_ip() -> str:
@@ -56,7 +69,10 @@ _LAN_URL = None
 def lan_url() -> str:
     global _LAN_URL
     if _LAN_URL is None:
-        _LAN_URL = f"http://{lan_ip()}:{PORT}"
+        # A loopback listener cannot be reached from a phone.  Do not advertise
+        # a misleading LAN URL in the status payload/QR dialog.
+        host = "127.0.0.1" if HOST in _LOOPBACK_HOSTS else lan_ip()
+        _LAN_URL = f"http://{host}:{PORT}"
     return _LAN_URL
 
 _proc_lock = threading.Lock()
@@ -179,35 +195,112 @@ KEY_SPEC = {
     "dhan":     [("DHAN_ACCESS_TOKEN", "Access Token", False), ("DHAN_CLIENT_ID", "Client ID", False), ("DHAN_INSTRUMENTS", "Security map JSON/path", True)],
     "fyers":    [("FYERS_APP_ID", "App ID", False), ("FYERS_ACCESS_TOKEN", "Access Token (daily)", False)],
 }
+_ALL_KEY_NAMES = frozenset(env for fields in KEY_SPEC.values() for env, _label, _optional in fields)
+_keys_lock = threading.Lock()
+_MAX_BODY_BYTES = 64 * 1024
+_MAX_KEY_VALUE_BYTES = 4096
 
 
 def load_keys() -> dict:
     try:
         with open(KEYS_PATH, encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
+            raw = json.load(f)
+        try:
+            os.chmod(KEYS_PATH, 0o600)
+        except OSError:
+            pass
+        if not isinstance(raw, dict):
+            return {}
+        # Ignore unknown entries from old/corrupt files.  Otherwise a value such
+        # as PYTHONPATH or LD_PRELOAD would be copied into the trading child.
+        clean = {}
+        for key, value in raw.items():
+            if key not in _ALL_KEY_NAMES or isinstance(value, bool):
+                continue
+            if isinstance(value, float) and not math.isfinite(value):
+                continue
+            text = str(value)
+            if text.strip() and "\x00" not in text and len(text) <= _MAX_KEY_VALUE_BYTES:
+                clean[key] = text
+        return clean
+    except (OSError, ValueError, TypeError):
         return {}
 
 
-def save_keys(values: dict) -> None:
-    keys = load_keys()
-    keys.update({k: v for k, v in values.items()})
-    with open(KEYS_PATH, "w", encoding="utf-8") as f:
-        json.dump(keys, f, indent=2)
+def save_keys(values: dict, broker: str | None = None) -> None:
+    allowed = {
+        env for env, _label, _optional in KEY_SPEC.get(broker, [])
+    } if broker else _ALL_KEY_NAMES
+    clean = {}
+    for key, value in values.items():
+        if (key not in allowed or isinstance(value, bool)
+                or not isinstance(value, (str, int, float))):
+            continue
+        if isinstance(value, float) and not math.isfinite(value):
+            continue
+        text = str(value).strip()
+        if text and len(text) <= _MAX_KEY_VALUE_BYTES and "\x00" not in text:
+            clean[key] = text
+    if not clean:
+        return
+    with _keys_lock:
+        keys = load_keys()
+        keys.update(clean)
+        tmp_path = f"{KEYS_PATH}.tmp.{os.getpid()}"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(keys, f, indent=2)
+                f.write("\n")
+            try:
+                os.chmod(tmp_path, 0o600)
+            except OSError:
+                pass
+            os.replace(tmp_path, KEYS_PATH)
+            try:
+                os.chmod(KEYS_PATH, 0o600)
+            except OSError:
+                pass
+        finally:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 # ── bot process control ──────────────────────────────────────────────────────
 def start_bot(opts: dict, source: str = "ui") -> dict:
     global bot_proc, bot_cfg
+    if not isinstance(opts, dict):
+        return {"ok": False, "error": "start options must be a JSON object"}
+
+    def _flag(value) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    broker = str(opts.get("broker", "simulated") or "simulated").strip().lower()
+    if broker not in KEY_SPEC:
+        return {"ok": False, "error": f"unsupported broker: {broker}"}
+    dry_run = _flag(opts.get("dry_run"))
+    ignore_hours = _flag(opts.get("ignore_hours"))
+    # Auto-start is never allowed to arm live orders from persisted UI state.
+    # Apply that downgrade before credential validation so a saved live-broker
+    # selection can still run safely in dry-run mode when credentials are absent.
+    if (source == "auto" and broker != "simulated" and not dry_run
+            and not _flag(opts.get("auto_live"))):
+        dry_run = True
+
     with _proc_lock:
         if bot_proc and bot_proc.poll() is None:
             return {"ok": False, "error": "already running"}
         if _bot_lock_busy():
             return {"ok": False, "error": "A Tejas bot is already running (another window or device). Stop it there first."}
-        broker = opts.get("broker", "simulated")
         # Safety: don't allow a LIVE broker to start without its credentials —
         # otherwise the UI shows a misleading "LIVE" state that can't trade.
-        if broker != "simulated" and not opts.get("dry_run"):
+        if broker != "simulated" and not dry_run:
             keys = load_keys()
             missing = [e for e, l, o in KEY_SPEC.get(broker, []) if not o and not keys.get(e)]
             if missing:
@@ -215,15 +308,12 @@ def start_bot(opts: dict, source: str = "ui") -> dict:
                         f"Can't go LIVE on {broker} — add API keys first "
                         f"({', '.join(missing)}). Click 🔑 API Keys, or enable Dry-run."}
         env = dict(os.environ)
-        # ★ Never let the unattended supervisor flip to LIVE orders on its own —
-        #   a headless auto-start requires an explicit auto_live opt, else force
-        #   dry-run. (Manual UI starts are unchanged.)
-        dry_run = bool(opts.get("dry_run"))
-        if source == "auto" and broker != "simulated" and not dry_run and not opts.get("auto_live"):
-            dry_run = True
+        # The UI token authenticates this dashboard only; do not copy it into the
+        # trading child process environment unnecessarily.
+        env.pop("TEJAS_UI_TOKEN", None)
         env["BROKER"]                = broker
         env["DRY_RUN"]               = "true" if dry_run else "false"
-        env["IGNORE_MARKET_HOURS"]   = "true" if opts.get("ignore_hours") else "false"
+        env["IGNORE_MARKET_HOURS"]   = "true" if ignore_hours else "false"
         # ★ VALIDATE numerics before injecting: the child parses these with
         #   float()/int() at import time with stderr discarded, so one bad value
         #   from the (unauthenticated, LAN-reachable) API or a corrupt
@@ -238,15 +328,35 @@ def start_bot(opts: dict, source: str = "ui") -> dict:
         env["BANKROLL"]              = _num(opts.get("bankroll"), float, 100000, 1000, 1e10)
         env["SCAN_INTERVAL_SECONDS"] = _num(opts.get("scan"), int, 30, 5, 3600)
         env.setdefault("ALPACA_API_KEY", "")
-        # inject saved broker credentials so the adapter's os.getenv() finds them
+        # Inject only the selected adapter's credentials. Passing every saved
+        # broker token to each child needlessly widens the blast radius of a
+        # process compromise and can confuse third-party SDK auto-discovery.
+        allowed_keys = {env_name for env_name, _label, _optional in KEY_SPEC[broker]}
         for k, v in load_keys().items():
-            if v:
+            if k in allowed_keys and v:
                 env[k] = str(v)
-        bot_proc = subprocess.Popen(
-            [sys.executable, "-u", os.path.join(BASE_DIR, "tejas.py")],
-            cwd=BASE_DIR, env=env,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
+        startup_log_path = os.path.join(BASE_DIR, "tejas.startup.log")
+        try:
+            # Import-time failures happen before tejas.py can configure its
+            # rotating logger.  Keep stderr only (the normal stdout stream is
+            # discarded so this file cannot duplicate the full trading log) and
+            # cap the diagnostic trail used by crash-loop recovery.
+            if os.path.exists(startup_log_path) and os.path.getsize(startup_log_path) > 1024 * 1024:
+                with open(startup_log_path, "wb"):
+                    pass
+            startup_log = open(startup_log_path, "ab")
+            try:
+                bot_proc = subprocess.Popen(
+                    [sys.executable, "-u", os.path.join(BASE_DIR, "tejas.py")],
+                    cwd=BASE_DIR, env=env,
+                    stdout=subprocess.DEVNULL, stderr=startup_log,
+                )
+            finally:
+                startup_log.close()
+        except OSError:
+            log.error("[Start] Could not launch Tejas child", exc_info=True)
+            bot_proc = None
+            return {"ok": False, "error": "could not launch Tejas"}
         bot_cfg = {k: env[k] for k in
                    ("BROKER", "DRY_RUN", "IGNORE_MARKET_HOURS", "BANKROLL")}
         if source == "ui":
@@ -525,7 +635,13 @@ def model_info() -> dict:
             info = json.load(f)
     except Exception:
         pass
-    info["exists"] = os.path.exists(os.path.join(BASE_DIR, "models", "lgb_gold.txt"))
+    # The dashboard's Train action builds the forward forecaster, which is
+    # stored separately from the live-outcome model. Checking only lgb_gold.txt
+    # made a successful forecast training run look like it never happened.
+    info["exists"] = any(
+        os.path.exists(os.path.join(BASE_DIR, "models", filename))
+        for filename in ("lgb_forecast.txt", "lgb_gold.txt")
+    )
     return info
 
 
@@ -556,8 +672,49 @@ def _do_train():
         train_state["running"] = False
 
 
+# ── HTTP request helpers ────────────────────────────────────────────────────────
+def _json_body(handler: BaseHTTPRequestHandler):
+    """Read a bounded JSON object from a mutating API request."""
+    raw_length = handler.headers.get("Content-Length", "0")
+    try:
+        length = int(raw_length)
+    except (TypeError, ValueError):
+        return None, 400, "invalid Content-Length"
+    if length < 0 or length > _MAX_BODY_BYTES:
+        return None, 413, "request body too large"
+    try:
+        raw = handler.rfile.read(length).decode("utf-8") if length else "{}"
+        value = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None, 400, "invalid JSON"
+    if not isinstance(value, dict):
+        return None, 400, "request body must be a JSON object"
+    return value, None, None
+
+
 # ── HTTP handler ────────────────────────────────────────────────────────────────
 class Handler(BaseHTTPRequestHandler):
+    def _authorized(self) -> bool:
+        if not UI_TOKEN:
+            return True
+        expected = "Basic " + base64.b64encode(
+            f"tejas:{UI_TOKEN}".encode("utf-8")
+        ).decode("ascii")
+        supplied = self.headers.get("Authorization", "")
+        if hmac.compare_digest(supplied, expected):
+            return True
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="Tejas dashboard"')
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return False
+
+    def _mutation_allowed(self) -> bool:
+        # A custom header makes cross-origin form/fetch requests fail the
+        # browser's simple-request path (and triggers preflight for fetch).
+        return self.headers.get("X-Tejas-Request") == "1"
+
     def log_message(self, *a):
         pass
 
@@ -565,11 +722,15 @@ class Handler(BaseHTTPRequestHandler):
         data = body.encode() if isinstance(body, str) else body
         self.send_response(code)
         self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Content-Length", str(len(data)))
         self.end_headers()
         self.wfile.write(data)
 
     def do_GET(self):
+        if not self._authorized():
+            return
         path = urlparse(self.path).path
         if path == "/":
             self._send(200, PAGE, "text/html; charset=utf-8")
@@ -583,8 +744,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"running": train_state["running"],
                                         "msg": train_state["msg"], "info": model_info()}))
         elif path == "/api/keys":
-            q = urlparse(self.path).query
-            broker = dict(p.split("=") for p in q.split("&") if "=" in p).get("broker", "simulated")
+            query = parse_qs(urlparse(self.path).query)
+            broker = (query.get("broker", ["simulated"])[0] or "simulated").strip().lower()
             saved = load_keys()
             fields = [{"env": env, "label": lbl, "opt": opt, "set": bool(saved.get(env))}
                       for env, lbl, opt in KEY_SPEC.get(broker, [])]
@@ -593,25 +754,40 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, "{}")
 
     def do_POST(self):
+        if not self._authorized():
+            return
+        if not self._mutation_allowed():
+            self._send(403, json.dumps({"ok": False, "error": "missing request header"}))
+            return
         path = urlparse(self.path).path
         if path == "/api/start":
-            length = int(self.headers.get("Content-Length", 0))
-            body = self.rfile.read(length).decode() if length else "{}"
-            try:
-                opts = json.loads(body or "{}")
-            except json.JSONDecodeError:
-                opts = {}
+            opts, status_code, error = _json_body(self)
+            if error:
+                self._send(status_code, json.dumps({"ok": False, "error": error}))
+                return
             self._send(200, json.dumps(start_bot(opts)))
         elif path == "/api/stop":
             self._send(200, json.dumps(stop_bot()))
         elif path == "/api/keys":
-            length = int(self.headers.get("Content-Length", 0))
-            try:
-                body = json.loads(self.rfile.read(length).decode() or "{}")
-            except json.JSONDecodeError:
-                body = {}
+            body, status_code, error = _json_body(self)
+            if error:
+                self._send(status_code, json.dumps({"ok": False, "error": error}))
+                return
+            broker = str(body.get("broker", "") or "").strip().lower()
+            values = body.get("values")
+            if broker not in KEY_SPEC:
+                self._send(400, json.dumps({"ok": False, "error": "unsupported broker"}))
+                return
+            if not isinstance(values, dict):
+                self._send(400, json.dumps({"ok": False, "error": "values must be an object"}))
+                return
+            allowed = {env for env, _label, _optional in KEY_SPEC[broker]}
+            unknown = sorted(set(values) - allowed)
+            if unknown:
+                self._send(400, json.dumps({"ok": False, "error": "unknown credential field"}))
+                return
             # only overwrite fields the user actually filled in (non-empty)
-            save_keys({k: v for k, v in (body.get("values") or {}).items() if str(v).strip()})
+            save_keys({k: v for k, v in values.items() if str(v).strip()}, broker=broker)
             self._send(200, json.dumps({"ok": True}))
         elif path == "/api/candidates/refresh":
             if not cand["computing"]:
@@ -805,16 +981,16 @@ PAGE = r"""<!doctype html><html lang="en" data-theme="light"><head><meta charset
      <button class="ghost" onclick="resetData()" style="margin-left:auto;padding:5px 11px;font-size:12px"
        title="Clear all recorded paper trades from the local DB (stop the bot first).">Reset</button></h2>
    <table><thead><tr><th>Stock</th><th class="num">Size ₹</th><th class="num">Entry</th>
-     <th class="num">LTP</th><th class="num">P&L</th></tr></thead>
-   <tbody id="postable"><tr><td colspan="5" class="muted">none</td></tr></tbody></table>
+     <th>In</th><th class="num">LTP</th><th class="num">P&L</th></tr></thead>
+   <tbody id="postable"><tr><td colspan="6" class="muted">none</td></tr></tbody></table>
   </div>
  </div>
 
  <div class="panel sec" style="margin-top:14px">
   <h2>📜 Trade History <span class="muted" style="font-weight:400;font-size:12px">— hover a row for the entry rationale</span></h2>
-  <table><thead><tr><th>Stock</th><th class="num">Entry</th><th class="num">Exit</th>
-    <th class="num">P&amp;L</th><th>Reason</th><th>Closed</th></tr></thead>
-  <tbody id="histtable"><tr><td colspan="6" class="muted">none yet</td></tr></tbody></table>
+  <table><thead><tr><th>Stock</th><th class="num">Entry</th><th>In</th><th class="num">Exit</th>
+    <th>Out</th><th class="num">P&amp;L</th><th>Reason</th></tr></thead>
+  <tbody id="histtable"><tr><td colspan="7" class="muted">none yet</td></tr></tbody></table>
  </div>
 
  <div class="panel sec" style="margin-top:14px"><h2>🧠 Reasoning &amp; Activity</h2><div id="log" class="muted">waiting…</div></div>
@@ -843,13 +1019,16 @@ PAGE = r"""<!doctype html><html lang="en" data-theme="light"><head><meta charset
 <script>
 const hist=[];let running=false;let lanUrl='';
 const $=id=>document.getElementById(id);
+const POST_HEADERS={'Content-Type':'application/json','X-Tejas-Request':'1'};
+function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));}
 function openQR(){const u=lanUrl||location.origin;$('qrUrl').textContent=u;
- const img=$('qrImg');img.style.display='block';
- img.src='https://api.qrserver.com/v1/create-qr-code/?size=240x240&margin=10&data='+encodeURIComponent(u);
+ // Keep the dashboard URL local. Sending it to a third-party QR service would
+ // disclose the LAN address (and any future access-token-bearing URL).
+ const img=$('qrImg');img.style.display='none';
  $('qrModal').classList.add('show');}
 function closeQR(){$('qrModal').classList.remove('show');}
 async function train(){if(!confirm('Train the forecast model on historical NSE data?\nTakes several minutes. (Re)start the bot afterward to use the new model.'))return;
- await fetch('/api/train',{method:'POST'});setTimeout(pollTrain,1000);}
+ await fetch('/api/train',{method:'POST',headers:POST_HEADERS});setTimeout(pollTrain,1000);}
 async function pollTrain(){let t;try{t=await(await fetch('/api/train')).json();}catch(e){return;}
  const el=$('modelStat');
  const i=t.info||{};
@@ -869,27 +1048,27 @@ function setTheme(t){document.documentElement.dataset.theme=t;localStorage.setIt
 $('themeBtn').onclick=()=>setTheme(document.documentElement.dataset.theme==='dark'?'light':'dark');
 setTheme(localStorage.getItem('tejas-theme')||'light');
 // actions
-async function start(){const r=await(await fetch('/api/start',{method:'POST',body:JSON.stringify(
+async function start(){const r=await(await fetch('/api/start',{method:'POST',headers:POST_HEADERS,body:JSON.stringify(
  {broker:broker.value,bankroll:bankroll.value,dry_run:dry.checked,ignore_hours:ign.checked})})).json();
  if(r&&r.ok===false)alert('⚠ '+(r.error||'could not start'));setTimeout(poll,400);}
 async function resetData(){if(!confirm('Clear all recorded paper trades from the local database?'))return;
- const r=await(await fetch('/api/reset',{method:'POST'})).json();
+ const r=await(await fetch('/api/reset',{method:'POST',headers:POST_HEADERS})).json();
  if(r&&r.ok===false)alert('⚠ '+(r.error||'failed'));setTimeout(poll,300);}
-async function stop(){await fetch('/api/stop',{method:'POST'});setTimeout(poll,400);}
+async function stop(){await fetch('/api/stop',{method:'POST',headers:POST_HEADERS});setTimeout(poll,400);}
 async function quit(){if(!confirm('Stop the bot and shut down the dashboard?'))return;
- try{await fetch('/api/quit',{method:'POST'});}catch(e){}
+ try{await fetch('/api/quit',{method:'POST',headers:POST_HEADERS});}catch(e){}
  document.body.innerHTML='<main><div class="panel sec">Server stopped. You can close this tab.</div></main>';}
-async function refresh(){$('refBtn').textContent='… scanning';await fetch('/api/candidates/refresh',{method:'POST'});setTimeout(pollCand,1500);}
+async function refresh(){$('refBtn').textContent='… scanning';await fetch('/api/candidates/refresh',{method:'POST',headers:POST_HEADERS});setTimeout(pollCand,1500);}
 // API keys modal
 async function openKeys(){const r=await(await fetch('/api/keys?broker='+broker.value)).json();
  $('keysBroker').textContent=BNAME[r.broker]||r.broker;const f=$('keysFields');
  if(!r.fields.length){f.innerHTML='<div class="warn">No API keys needed for Paper (simulated). Pick a real broker to enter keys.</div>';}
- else{f.innerHTML=r.fields.map(x=>`<div class="kf"><label>${x.label}${x.opt?' · optional':''}${x.set?'<span class="set">● saved</span>':''}</label>
-   <input type="password" data-env="${x.env}" placeholder="${x.set?'•••••• (leave blank to keep)':'enter value'}"></div>`).join('');}
+ else{f.innerHTML=r.fields.map(x=>`<div class="kf"><label>${esc(x.label)}${x.opt?' · optional':''}${x.set?'<span class="set">● saved</span>':''}</label>
+   <input type="password" data-env="${esc(x.env)}" placeholder="${x.set?'•••••• (leave blank to keep)':'enter value'}"></div>`).join('');}
  $('keysModal').classList.add('show');}
 function closeKeys(){$('keysModal').classList.remove('show');}
 async function saveKeys(){const vals={};document.querySelectorAll('#keysFields input').forEach(i=>{if(i.value.trim())vals[i.dataset.env]=i.value.trim();});
- await fetch('/api/keys',{method:'POST',body:JSON.stringify({broker:broker.value,values:vals})});closeKeys();
+ await fetch('/api/keys',{method:'POST',headers:POST_HEADERS,body:JSON.stringify({broker:broker.value,values:vals})});closeKeys();
  if(Object.keys(vals).length)alert('Saved ✓ — used next time you Start the bot.');}
 $('keysModal').addEventListener('click',e=>{if(e.target.id==='keysModal')closeKeys();});
 $('qrModal').addEventListener('click',e=>{if(e.target.id==='qrModal')closeQR();});
@@ -924,36 +1103,39 @@ async function poll(){let s;try{s=await(await fetch('/api/status')).json();}catc
  spark();
  $('postable').innerHTML=(s.positions&&s.positions.length)?s.positions.map(p=>{const pl=p.pnl_pct;
    const cls=pl==null?'muted':(pl>=0?'pos':'neg');
-   return `<tr><td><b>${p.symbol}</b></td><td class="num">${money(+p.size_usd)}</td><td class="num">${(+p.entry_price).toFixed(2)}</td>
-    <td class="num">${p.current_price?(+p.current_price).toFixed(2):'—'}</td>
+   const when_in=p.entry_time?p.entry_time.slice(0,16).replace('T',' '):'—';
+   return `<tr><td><b>${esc(p.symbol)}</b></td><td class="num">${money(+p.size_usd)}</td><td class="num">${(+p.entry_price).toFixed(2)}</td>
+    <td class="muted">${esc(when_in)}</td><td class="num">${p.current_price?(+p.current_price).toFixed(2):'—'}</td>
     <td class="num ${cls}">${pl==null?'—':(pl>=0?'+':'')+pl.toFixed(2)+'%'}</td></tr>`;}).join('')
-   :'<tr><td colspan="5" class="muted">none yet</td></tr>';
+   :'<tr><td colspan="6" class="muted">none yet</td></tr>';
  const L=$('log');const atBottom=L.scrollTop+L.clientHeight>=L.scrollHeight-20;
  L.textContent=(s.log||[]).join('\n');if(atBottom)L.scrollTop=L.scrollHeight;
 }
 async function pollCand(){let c;try{c=await(await fetch('/api/candidates')).json();}catch(e){return;}
  $('refBtn').textContent=c.computing?'… scanning':'↻ Scan';
- if(c.items&&c.items.length){const mx=Math.max(...c.items.map(i=>Math.abs(i.score)))||1;
-  $('cands').innerHTML=c.items.map((it,i)=>{const pct=Math.round(Math.max(0,it.score)/mx*100);
-   const vd=it.thesis.split(':')[0];
-   return `<tr><td class="rank">${i+1}</td><td><b>${it.symbol}</b><div class="tag">@₹${it.price}</div></td>
+ if(c.items&&c.items.length){const mx=Math.max(...c.items.map(i=>Math.abs(Number(i.score)||0)))||1;
+  $('cands').innerHTML=c.items.map((it,i)=>{const pct=Math.max(0,Math.min(100,Math.round((Number(it.score)||0)/mx*100)));
+   const thesis=String(it.thesis||''); const vd=thesis.split(':')[0];
+   return `<tr><td class="rank">${i+1}</td><td><b>${esc(it.symbol)}</b><div class="tag">@₹${esc(it.price)}</div></td>
     <td><div class="bar"><i style="width:${pct}%"></i></div></td>
-    <td class="num">${(it.edge*100).toFixed(1)}%</td>
-    <td style="max-width:320px"><span class="vd">${vd}</span> ${it.thesis.split(':').slice(1).join(':')}</td></tr>`;}).join('');
+    <td class="num">${(Number(it.edge||0)*100).toFixed(1)}%</td>
+    <td style="max-width:320px"><span class="vd">${esc(vd)}</span> ${esc(thesis.split(':').slice(1).join(':'))}</td></tr>`;}).join('');
   $('candmeta').textContent=`Ranked ${c.items.length} · regime ${pretty(c.regime?c.regime.regime:'')} · VIX ${c.regime?c.regime.vix:''} · ${c.updated}`;}
  else if(c.computing){$('candmeta').textContent='Scanning NSE universe…';}
  if(c.computing)setTimeout(pollCand,1500);
 }
 async function pollHist(){let h;try{h=await(await fetch('/api/history')).json();}catch(e){return;}
  $('histtable').innerHTML=(h&&h.length)?h.map(t=>{const up=(t.pnl_pct||0)>=0;
-  const when=t.exit_time?t.exit_time.slice(0,16).replace('T',' '):'—';
+  const when_in=t.entry_time?t.entry_time.slice(0,16).replace('T',' '):'—';
+  const when_out=t.exit_time?t.exit_time.slice(0,16).replace('T',' '):'—';
   const reason=(t.exit_reason||'').split('_').slice(0,2).join(' ');
-  const why=(t.rationale||'').replace(/"/g,'&quot;');
-  return `<tr title="${why}"><td><b>${t.symbol}</b>${t.trimmed?' <span class="tag">✂ trimmed</span>':''}</td>
-   <td class="num">${(+t.entry_price).toFixed(2)}</td><td class="num">${t.exit_price?(+t.exit_price).toFixed(2):'—'}</td>
+  const why=t.rationale||'';
+  return `<tr title="${esc(why)}"><td><b>${esc(t.symbol)}</b>${t.trimmed?' <span class="tag">✂ trimmed</span>':''}</td>
+   <td class="num">${(+t.entry_price).toFixed(2)}</td><td class="muted">${esc(when_in)}</td>
+   <td class="num">${t.exit_price?(+t.exit_price).toFixed(2):'—'}</td><td class="muted">${esc(when_out)}</td>
    <td class="num ${up?'pos':'neg'}">${(up?'+':'')+((t.pnl_pct||0)*100).toFixed(2)}% (₹${Math.round(t.pnl_usd||0)})</td>
-   <td>${reason}</td><td class="muted">${when}</td></tr>`;}).join('')
-  :'<tr><td colspan="6" class="muted">none yet</td></tr>';
+   <td>${esc(reason)}</td></tr>`;}).join('')
+  :'<tr><td colspan="7" class="muted">none yet</td></tr>';
 }
 function updateClock(){$('clock').textContent=new Date().toLocaleTimeString('en-IN',{timeZone:'Asia/Kolkata',hour12:false})+' IST';}
 setInterval(updateClock,1000);updateClock();

@@ -16,15 +16,15 @@ TRIGGER 6: MARKET_CLOSE    — force close before end of day (optional)
     watchdog/supervisor running, and never rely on an exchange-side stop.
 """
 import logging
+import math
 import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
-import numpy as np
-
 from analyst_engine import AnalystEngine
 from brokers.base import BaseBroker
 from config import Config
+from earnings_filter import EarningsFilter
 from feature_builder_gold import FeatureBuilderGold
 from ml_engine_gold import MLEngineGold
 from models import Bar, Trade
@@ -35,10 +35,13 @@ EMA_ALPHA = 0.25
 
 
 class ExitEngine:
-    def __init__(self, broker: BaseBroker, ml: MLEngineGold, feature_builder: FeatureBuilderGold):
+    def __init__(self, broker: BaseBroker, ml: MLEngineGold,
+                 feature_builder: FeatureBuilderGold,
+                 earnings: Optional[EarningsFilter] = None):
         self.broker   = broker
         self.ml       = ml
         self.builder  = feature_builder
+        self.earnings = earnings
         self.analyst  = AnalystEngine()
         self._regime: Dict = {"regime": "unknown"}
         self._state: Dict[str, dict] = {}
@@ -79,11 +82,30 @@ class ExitEngine:
         # Live price — if the feed fails, SKIP this check rather than fabricate
         # a price from entry_price (which invents pnl=0 exits with real fees).
         quote = self.broker.get_quote(trade.symbol, force=True)
-        if quote is None or quote.mid <= 0:
+        try:
+            quote_mid = float(quote.mid) if quote is not None else 0.0
+        except (TypeError, ValueError):
+            quote_mid = 0.0
+        if quote_mid <= 0:
             log.debug(f"[Exit] {trade.symbol}: no quote — skipping this check")
             return None
-        current_price = quote.mid
-        pnl_pct = (current_price - trade.entry_price) / trade.entry_price
+        current_price = quote_mid
+        try:
+            entry_price = float(trade.entry_price)
+        except (TypeError, ValueError):
+            return None
+        if (not math.isfinite(current_price) or current_price <= 0 or
+                not math.isfinite(entry_price) or entry_price <= 0):
+            log.warning(f"[Exit] {trade.symbol}: invalid quote/entry price — skipping")
+            return None
+        pnl_pct = (current_price - entry_price) / entry_price
+
+        # EarningsFilter caches the calendar. Wire its existing pre-event exit
+        # policy into the live monitor so the documented two-hour protection is
+        # actually enforced for open positions.
+        if (getattr(Config, "USE_EARNINGS_GATE", False) and self.earnings and
+                self.earnings.should_exit_before_earnings(trade.symbol, fetch=False)):
+            return "EARNINGS", current_price, pnl_pct
 
         # Update trailing high-water mark (persisted so restarts don't disarm it)
         if trade.side == "BUY":

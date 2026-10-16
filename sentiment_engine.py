@@ -148,8 +148,13 @@ class SentimentEngine:
             articles = search_news(ysym, count=10)
             scores = []
             for a in articles:
-                tickers = {str(t).upper() for t in (a.get("relatedTickers") or [])}
-                title = (a.get("title") or "")
+                if not isinstance(a, dict):
+                    continue
+                raw_tickers = a.get("relatedTickers") or []
+                if isinstance(raw_tickers, str):
+                    raw_tickers = [raw_tickers]
+                tickers = {str(t).upper() for t in raw_tickers}
+                title = str(a.get("title") or "")
                 # ★ Whole-word matching everywhere. Raw substring matching blocked
                 # stocks on BULLISH headlines: "sec" ⊂ "sector", "cut" ⊂ "execute",
                 # and short roots misfired relevance ("LT" ⊂ "DEFAULT").
@@ -168,7 +173,8 @@ class SentimentEngine:
                 scores.append((bull - bear) / total if total else 0.0)
             if not scores:
                 return (0.0, 0)
-            return (float(sum(scores) / len(scores)), len(scores))
+            score = sum(scores) / len(scores)
+            return (float(max(-1.0, min(1.0, score))), len(scores))
         except Exception as e:
             # Fail-open is the right call (a news outage must not halt trading),
             # but at WARNING so the operator can see the gate has gone dark.
@@ -196,20 +202,32 @@ class SentimentEngine:
             resp.raise_for_status()
             data = resp.json()
 
-            if "feed" not in data:
+            feed = data.get("feed") if isinstance(data, dict) else None
+            if not isinstance(feed, list):
                 return 0.0
 
             scores = []
-            for article in data["feed"][:10]:
-                for ticker_info in article.get("ticker_sentiment", []):
-                    if ticker_info.get("ticker", "").upper() == symbol.upper():
+            for article in feed[:10]:
+                if not isinstance(article, dict):
+                    continue
+                ticker_sentiment = article.get("ticker_sentiment") or []
+                if not isinstance(ticker_sentiment, list):
+                    continue
+                for ticker_info in ticker_sentiment:
+                    if not isinstance(ticker_info, dict):
+                        continue
+                    if str(ticker_info.get("ticker", "")).upper() == symbol.upper():
                         try:
                             score = float(ticker_info.get("ticker_sentiment_score", 0))
-                            scores.append(score)
+                            if score == score and score not in (float("inf"), float("-inf")):
+                                scores.append(score)
                         except (ValueError, TypeError):
                             pass
 
-            return float(sum(scores) / len(scores)) if scores else 0.0
+            if not scores:
+                return 0.0
+            score = sum(scores) / len(scores)
+            return float(max(-1.0, min(1.0, score)))
 
         except Exception as e:
             log.debug(f"[Sentiment] AlphaVantage failed {symbol}: {e}")

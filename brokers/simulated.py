@@ -12,6 +12,7 @@ Two testing modes:
                                        (Recommended for actually testing strategy.)
 """
 import logging
+import math
 import time
 from typing import Dict, List, Optional
 
@@ -39,26 +40,83 @@ class SimulatedBroker(BaseBroker):
 
     def _restore_from_db(self):
         """Rebuild the cash/holdings book from open trades persisted in a prior
-        session so paper equity & positions carry over (nothing lost on restart)."""
+        session so paper equity & positions carry over (nothing lost on restart).
+
+        ★ Must respect partial exits: an open trade that already had its
+        first-target trim holds (shares − trim_shares) at the broker. Restoring
+        the FULL share count re-inflated the book with phantom shares every
+        restart after a trim — paper equity overstated and reconciliation
+        reported drift forever."""
         try:
             import db
             rows = db.fetchall(
-                "SELECT symbol, shares, size_usd, entry_price "
+                "SELECT symbol, shares, size_usd, entry_price, trim_shares, trim_price "
                 "FROM trades WHERE status='open'"
             )
-            spent = 0.0
+            deployed = 0.0
             for r in rows:
-                qty = float(r["shares"] or 0)
-                cost = float(r["size_usd"] or 0)
-                avg = float(r["entry_price"] or 0)
-                if qty <= 0 or avg <= 0:
+                try:
+                    total_qty = float(r["shares"] or 0)
+                    avg = float(r["entry_price"] or 0)
+                    trimmed = float(r["trim_shares"] or 0)
+                except (KeyError, TypeError, ValueError):
+                    log.warning("[simulated] skipping malformed open-trade row during restore")
                     continue
-                self.book[r["symbol"]] = {"qty": qty, "avg": avg}
-                spent += cost
-            if self.book:
-                self.cash = max(0.0, self.cash - spent)
+                if (not math.isfinite(total_qty) or not math.isfinite(avg)
+                        or not math.isfinite(trimmed) or total_qty <= 0 or avg <= 0):
+                    log.warning("[simulated] skipping invalid open-trade values during restore")
+                    continue
+                trimmed = min(max(trimmed, 0.0), total_qty)
+                qty = total_qty - trimmed
+                pos = self.book.get(r["symbol"])
+                if pos:
+                    old_qty = pos["qty"]
+                    combined = old_qty + qty
+                    pos["avg"] = ((pos["avg"] * old_qty) + (avg * qty)) / combined if combined else 0.0
+                    pos["qty"] = combined
+                elif qty > 0:
+                    self.book[r["symbol"]] = {"qty": qty, "avg": avg}
+                try:
+                    trim_px = float(r["trim_price"] or avg)
+                except (TypeError, ValueError):
+                    trim_px = avg
+                if not math.isfinite(trim_px) or trim_px <= 0:
+                    trim_px = avg
+                # Restore the cash committed to the remaining position while
+                # replaying proceeds from any persisted partial trim.
+                deployed += total_qty * avg - trimmed * trim_px
+
+            # Closed-paper P&L is not represented in the open-trade rows. Without
+            # restoring it, every dashboard/bot restart silently resets realized
+            # gains and losses to the configured bankroll, which breaks equity,
+            # drawdown, and sizing continuity. Ignore malformed legacy P&L rows
+            # rather than making the entire paper book unavailable.
+            realized_pnl = 0.0
+            try:
+                closed_rows = db.fetchall(
+                    "SELECT pnl_usd FROM trades WHERE status='closed' AND pnl_usd IS NOT NULL"
+                )
+                for r in closed_rows:
+                    try:
+                        pnl = float(r["pnl_usd"])
+                        if math.isfinite(pnl):
+                            realized_pnl += pnl
+                    except (KeyError, TypeError, ValueError):
+                        continue
+            except Exception:
+                log.warning("[simulated] realized P&L restore skipped", exc_info=True)
+
+            # __init__ seeds ``self.cash`` from Config.BANKROLL; using the
+            # current field also keeps restoration safe for callers that build a
+            # broker double with an explicit starting cash balance.
+            base_cash = float(self.cash)
+            if not math.isfinite(base_cash) or base_cash < 0:
+                log.warning("[simulated] invalid configured bankroll; restore skipped")
+                return
+            self.cash = max(0.0, base_cash + realized_pnl - deployed)
+            if self.book or realized_pnl:
                 log.info(f"[simulated] Restored {len(self.book)} position(s) from previous session "
-                         f"(₹{spent:,.0f} deployed)")
+                         f"(₹{deployed:,.0f} deployed, realized P&L ₹{realized_pnl:+,.0f})")
         except Exception as e:
             log.warning(f"[simulated] position restore skipped: {e}")
 
@@ -103,7 +161,10 @@ class SimulatedBroker(BaseBroker):
     def _market_value(self) -> float:
         mv = 0.0
         for sym, pos in self.book.items():
-            px = self._last_price(sym)
+            # Account/position snapshots often run back-to-back. Reuse the
+            # short quote cache here; order placement keeps the default forced
+            # refresh so entries/exits still use a current price.
+            px = self._last_price(sym, force=False)
             mv += pos["qty"] * (px if px > 0 else pos["avg"])
         return mv
 
@@ -119,7 +180,7 @@ class SimulatedBroker(BaseBroker):
     def _positions(self) -> List[dict]:
         out = []
         for sym, pos in self.book.items():
-            px = self._last_price(sym) or pos["avg"]
+            px = self._last_price(sym, force=False) or pos["avg"]
             out.append({
                 "symbol": sym,
                 "qty": pos["qty"],
@@ -131,7 +192,7 @@ class SimulatedBroker(BaseBroker):
         return out
 
     # ── order hooks (only used when DRY_RUN=false) ────────────────────────────
-    def _place_entry(self, symbol, side, qty) -> Optional[dict]:
+    def _place_entry(self, symbol, side, qty, client_order_id="") -> Optional[dict]:
         px = self._last_price(symbol)
         if px <= 0:
             log.warning(f"[simulated] no price for {symbol} — order rejected")
@@ -159,7 +220,7 @@ class SimulatedBroker(BaseBroker):
             pos["qty"] -= qty
             if pos["qty"] <= 0:
                 self.book.pop(symbol, None)
-        oid = f"sim_{int(time.time()*1000)}"
+        oid = client_order_id if client_order_id else f"sim_{int(time.time()*1000)}"
         log.info(f"[simulated] FILL {side.upper()} {qty} {symbol} @ ₹{px:.2f} "
                  f"| cash=₹{self.cash:,.0f}")
         return {"id": oid, "symbol": symbol, "qty": qty, "filled_avg_price": px}

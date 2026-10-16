@@ -1,22 +1,23 @@
-# Environment files
+# Environment and local configuration
 .env
 .env.*
 !.env.example
-# Local configuration
+.getenv*
 *.local.json
 
-# Database
+# Databases and runtime state
 *.db
 *.db-shm
 *.db-wal
+*.heartbeat
+tejas.paused
 
 # Logs
 *.log
-
-# Runtime
-*.heartbeat
+*.log.*
 
 # Secrets
+keys.local.json
 *.pem
 *.key
 *.p12
@@ -35,17 +36,12 @@ __pycache__/
 venv/
 env/
 
-# IDE
+# IDE and OS
 .vscode/
 .idea/
-*.local.json
-*.db
-*.db-shm
-*.db-wal
-*.log
-*.heartbeat
-
-
-# OS
 Thumbs.db
 .DS_Store
+
+# Generated/retrained model artifacts
+models/lgb_gold.txt
+models/*.pkl

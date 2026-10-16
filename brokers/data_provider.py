@@ -14,6 +14,7 @@ adapters when their historical endpoint needs an instrument token you haven't
 wired up yet.
 """
 import logging
+import math
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -35,15 +36,19 @@ log = logging.getLogger(__name__)
 
 
 def make_session(pool: int = _MAX_WORKERS + 4) -> requests.Session:
-    """A requests session sized for our concurrency (avoids the 'Connection pool
-    is full' churn) with automatic retry/backoff on transient 429/5xx."""
+    """Create a pooled session with retries safe for market-data requests.
+
+    POST is deliberately excluded from urllib3 retries. A broker order POST can
+    succeed at the venue while its response is lost; retrying it automatically
+    could submit a duplicate order.
+    """
     s = requests.Session()
     s.headers.update({"User-Agent": "Mozilla/5.0", "Accept": "application/json"})
     retry = None
     if Retry is not None:
         retry = Retry(total=3, backoff_factor=0.5,
                       status_forcelist=[429, 500, 502, 503, 504],
-                      allowed_methods=frozenset(["GET", "POST"]))
+                      allowed_methods=frozenset(["GET"]))
     adapter = HTTPAdapter(pool_connections=pool, pool_maxsize=pool, max_retries=retry)
     s.mount("https://", adapter)
     s.mount("http://", adapter)
@@ -202,14 +207,25 @@ class YahooDataProvider:
                     c = closes[i]
                     if c is None:
                         continue
+                    c = float(c)
+                    o = float(opens[i] if opens[i] is not None else c)
+                    hi = float(highs[i] if highs[i] is not None else c)
+                    lo = float(lows[i] if lows[i] is not None else c)
+                    vol = float(vols[i] or 0)
+                    stamp = float(ts[i])
+                    if not all(math.isfinite(v) for v in (c, o, hi, lo, vol, stamp)):
+                        continue
+                    if (c <= 0 or o <= 0 or hi <= 0 or lo <= 0 or vol < 0 or
+                            hi < max(o, c) or lo > min(o, c) or hi < lo):
+                        continue
                     bars.append(Bar(
                         symbol=symbol,
                         timestamp=datetime.fromtimestamp(ts[i], tz=timezone.utc),
-                        open=float(opens[i] if opens[i] is not None else c),
-                        high=float(highs[i] if highs[i] is not None else c),
-                        low=float(lows[i] if lows[i] is not None else c),
-                        close=float(c),
-                        volume=int(vols[i] or 0),
+                        open=o,
+                        high=hi,
+                        low=lo,
+                        close=c,
+                        volume=int(vol),
                         vwap=float(c),
                     ))
                 except (IndexError, TypeError, ValueError):
@@ -233,14 +249,21 @@ class YahooDataProvider:
                 return None
             meta = result[0].get("meta", {})
             price = float(meta.get("regularMarketPrice") or 0)
-            if price <= 0:
+            if not math.isfinite(price) or price <= 0:
                 return None
             # ★ Real freshness: stamp the quote with the exchange's last trade time,
             #   NOT now(). Otherwise every stale/closed-market price looks "fresh"
             #   and downstream staleness gates are defeated.
             mt = meta.get("regularMarketTime")
-            ts = (datetime.fromtimestamp(int(mt), tz=timezone.utc)
-                  if mt else datetime.now(timezone.utc))
+            try:
+                # A missing exchange timestamp is not evidence that the quote is
+                # current. Use the Unix epoch so the entry-staleness gate fails
+                # closed instead of stamping an old quote with datetime.now().
+                ts = (datetime.fromtimestamp(int(mt), tz=timezone.utc)
+                      if mt and math.isfinite(float(mt)) else
+                      datetime.fromtimestamp(0, tz=timezone.utc))
+            except (TypeError, ValueError, OverflowError):
+                ts = datetime.fromtimestamp(0, tz=timezone.utc)
             half = price * 0.0005  # 0.05% synthetic spread
             return Quote(symbol=symbol, bid=price - half, ask=price + half,
                          bid_size=1, ask_size=1, timestamp=ts)

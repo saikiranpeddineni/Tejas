@@ -139,7 +139,7 @@ def _bb(p, n=20, s=2.0):
     return mid+s*std, mid, mid-s*std
 
 def _safe(arr, default=0.0):
-    v = arr[~np.isnan(arr)]
+    v = arr[np.isfinite(arr)]
     return float(v[-1]) if len(v) > 0 else default
 
 def _williams_r(h, l, c, n=14):
@@ -229,8 +229,28 @@ class FeatureBuilderGold:
         if len(bars) < 30:
             return None
 
+        # Do not turn a malformed feed row into NaN features.  Most indicators
+        # tolerate a missing warm-up value, but a single bad OHLCV bar can
+        # otherwise leak NaNs through log returns/rolling windows and reach the
+        # model and JSON training store.
+        try:
+            for bar in bars:
+                values = (bar.open, bar.high, bar.low, bar.close, bar.volume)
+                if not all(np.isfinite(float(v)) for v in values):
+                    return None
+                if (bar.open <= 0 or bar.high <= 0 or bar.low <= 0
+                        or bar.close <= 0 or bar.volume < 0
+                        or bar.high < bar.low
+                        or bar.high < max(bar.open, bar.close)
+                        or bar.low > min(bar.open, bar.close)):
+                    return None
+        except (TypeError, ValueError):
+            return None
+
         c, h, l, o, v, vw = _bars_to_arrays(bars)
-        price = float(quote.mid) if quote and quote.mid > 0 else float(c[-1])
+        quote_mid = quote.mid if quote else 0.0
+        price = (float(quote_mid)
+                 if np.isfinite(quote_mid) and quote_mid > 0 else float(c[-1]))
         if price <= 0:
             return None
 
@@ -307,6 +327,8 @@ class FeatureBuilderGold:
 
         # Live bid-ask spread
         spread = float(quote.spread_pct) if quote else 0.001
+        if not np.isfinite(spread) or spread < 0:
+            spread = 0.001
 
         # ★ Candle stability (GainzAlgo-inspired): body / full range, averaged
         #   over the last 3 bars. 1 = decisive full-bodied candles behind the
@@ -389,10 +411,19 @@ class FeatureBuilderGold:
                 cutoff = last_ts.date() if hasattr(last_ts, "date") else last_ts
                 spy = [b for b in spy if b.timestamp.date() <= cutoff]
             if len(spy) < 21: return neutral
-            sc = np.array([b.close for b in spy])
+            spy = [b for b in spy
+                   if np.isfinite(float(b.close)) and float(b.close) > 0]
+            if len(spy) < 21:
+                return neutral
+            sc = np.array([b.close for b in spy], dtype=np.float64)
             n  = min(len(sc), len(c))
             sr = np.diff(np.log(sc[-21:])); tr = np.diff(np.log(c[-21:]))
-            corr = float(np.corrcoef(tr, sr)[0,1]) if len(sr)>=2 and len(tr)>=2 and n>=21 else 0.
+            corr = 0.
+            if (len(sr) >= 2 and len(tr) >= 2 and n >= 21
+                    and np.std(sr) > 0 and np.std(tr) > 0):
+                corr = float(np.corrcoef(tr, sr)[0, 1])
+                if not np.isfinite(corr):
+                    corr = 0.
             spy_ret = float((sc[-1]-sc[-21])/sc[-21])
             stk_ret = float((c[-1]-c[-21])/c[-21]) if len(c) >= 21 else 0.
             mkt_vol = float(np.std(sr) * np.sqrt(252)) if len(sr) >= 2 else 0.
@@ -416,7 +447,9 @@ class FeatureBuilderGold:
             if last_ts is not None and bars:
                 cutoff = last_ts.date() if hasattr(last_ts, "date") else last_ts
                 bars = [b for b in bars if b.timestamp.date() <= cutoff]
-            if bars and len(bars) >= 11:
+            bars = [b for b in (bars or [])
+                    if np.isfinite(float(b.close)) and float(b.close) > 0]
+            if len(bars) >= 11:
                 return float((bars[-1].close - bars[-11].close) / bars[-11].close)
         except Exception: pass
         return 0.

@@ -8,6 +8,7 @@ All signals pass through 4 extra pre-filters before being ranked:
   ★ Sentiment edge boost (add 0.5% to edge for positive-news stocks)
 """
 import logging
+import math
 import time as _time
 import uuid
 from datetime import datetime, timezone
@@ -162,22 +163,35 @@ class SignalEngineGold:
         quote: Optional[Quote],
         regime: Dict,
     ) -> Optional[Signal]:
-        current_price = quote.mid if quote and quote.mid > 0 else bars[-1].close
+        try:
+            current_price = float(quote.mid) if quote and quote.mid > 0 else float(bars[-1].close)
+        except (TypeError, ValueError, IndexError):
+            return None
+        if not math.isfinite(current_price) or current_price <= 0:
+            return None
         if current_price < Config.MIN_PRICE or current_price > Config.MAX_PRICE:
             return None
-        if quote and quote.spread_pct > Config.MAX_SPREAD_PCT:
-            return None
+        if quote:
+            try:
+                spread_pct = float(quote.spread_pct)
+            except (TypeError, ValueError):
+                return None
+            if (not math.isfinite(spread_pct) or spread_pct < 0 or
+                    spread_pct > Config.MAX_SPREAD_PCT):
+                return None
 
         # ── ★ Liquidity floor: require real ₹ turnover so entry/exit slippage
         #   stays negligible vs position size (a relative volume ratio can't catch
         #   an absolutely thin micro-cap). Previously configured but never enforced.
         if Config.MIN_ADV_VALUE > 0:
             recent = bars[-Config.ADV_LOOKBACK_DAYS:]
-            advs = sorted(b.close * b.volume for b in recent if b.volume)
-            if advs:
-                adv = advs[len(advs) // 2]   # median daily traded value (₹)
-                if adv < Config.MIN_ADV_VALUE:
-                    return None
+            advs = sorted(b.close * b.volume for b in recent
+                          if b.volume and math.isfinite(b.close) and b.close > 0)
+            if not advs:
+                return None
+            adv = advs[len(advs) // 2]   # median daily traded value (₹)
+            if adv < Config.MIN_ADV_VALUE:
+                return None
 
         trade_id = str(uuid.uuid4())[:12]
         features = self.builder.build(symbol, bars, quote, trade_id=trade_id)
@@ -224,8 +238,11 @@ class SignalEngineGold:
         stop_loss   = max(stop_loss,   current_price * (1 - Config.STOP_MAX_PCT))
         take_profit = min(take_profit, current_price * 1.15)
 
-        log.info(f"[Analyst] {symbol}: {view['thesis']} "
-                 f"(score={view['composite']:+.2f} edge={adjusted_edge:.3f} conf={conf:.2f})")
+        # This runs once per symbol in a potentially 500-name scan. Keep the
+        # detailed rationale available for debug sessions without filling the
+        # rotating production log and delaying stop monitoring.
+        log.debug(f"[Analyst] {symbol}: {view['thesis']} "
+                  f"(score={view['composite']:+.2f} edge={adjusted_edge:.3f} conf={conf:.2f})")
 
         # ★ The WHY — one line a human can audit later, persisted with the trade
         # and sent in the entry alert. (Fundamentals health is appended by the

@@ -79,6 +79,8 @@ class MLEngineGold:
         self.val_auc   = 0.0
         self.train_auc = 0.0
         self.walk_forward_auc = 0.0   # ★ honest metric
+        self._model_file: Optional[str] = None
+        self._metrics_match_model = False
         self._new_since_train = 0
         self._load_models()
 
@@ -89,12 +91,36 @@ class MLEngineGold:
     def _metrics_path(self)  -> str: return os.path.join(Config.MODEL_DIR, "ml_metrics.json")
 
     def _save_metrics(self):
-        """Persist AUC so the trust gate (is_trustworthy) survives restarts — a
-        loaded model has no in-memory AUC otherwise."""
+        """Persist AUC per model file so forecast training cannot overwrite the
+        trust metadata for the live-outcome model (and vice versa).
+
+        The legacy top-level fields remain for older dashboard readers; the
+        nested map is authoritative when present.
+        """
         try:
-            with open(self._metrics_path(), "w") as f:
-                json.dump({"val_auc": self.val_auc,
-                           "walk_forward_auc": self.walk_forward_auc}, f)
+            path = self._metrics_path()
+            payload = {}
+            try:
+                with open(path) as f:
+                    payload = json.load(f)
+            except Exception:
+                pass
+            models = payload.get("models", {}) if isinstance(payload, dict) else {}
+            if not isinstance(models, dict):
+                models = {}
+            model_file = os.path.basename(self._model_file or self._lgb_path())
+            models[model_file] = {
+                "val_auc": self.val_auc,
+                "walk_forward_auc": self.walk_forward_auc,
+            }
+            payload = {
+                "val_auc": self.val_auc,
+                "walk_forward_auc": self.walk_forward_auc,
+                "model_file": model_file,
+                "models": models,
+            }
+            with open(path, "w") as f:
+                json.dump(payload, f)
         except Exception as e:
             log.debug(f"[ML] could not save metrics: {e}")
 
@@ -125,6 +151,7 @@ class MLEngineGold:
                 )
                 continue
             self.lgb_model = booster
+            self._model_file = os.path.basename(model_file)
             self.feature_importance = booster.feature_importance("gain")
             log.info(f"✓ LightGBM loaded ({os.path.basename(model_file)})")
             break
@@ -134,11 +161,37 @@ class MLEngineGold:
         try:
             with open(self._metrics_path()) as f:
                 m = json.load(f)
-            self.val_auc = float(m.get("val_auc", 0.0))
-            self.walk_forward_auc = float(m.get("walk_forward_auc", 0.0))
+            selected = (m.get("models", {}).get(self._model_file)
+                        if isinstance(m, dict) and isinstance(m.get("models"), dict)
+                        and self._model_file else None)
+            if isinstance(selected, dict):
+                metrics = selected
+                self._metrics_match_model = True
+            else:
+                metrics = m
+                metrics_file = os.path.basename(str(m.get("model_file", "")))
+                self._metrics_match_model = bool(
+                    self._model_file and metrics_file and metrics_file == self._model_file
+                )
+                if not self._metrics_match_model and self._model_file:
+                    log.warning(
+                        f"[ML] Metrics/model mismatch ({metrics_file or 'un-tagged'} vs "
+                        f"{self._model_file}) — ML trust gate disabled until retrain"
+                    )
+            self.val_auc = float(metrics.get("val_auc", 0.0))
+            self.walk_forward_auc = float(metrics.get("walk_forward_auc", 0.0))
+            if not np.isfinite(self.val_auc) or not np.isfinite(self.walk_forward_auc):
+                raise ValueError("non-finite persisted metrics")
         except Exception:
-            pass
-        if XGB_AVAILABLE and os.path.exists(self._xgb_path()):
+            self.val_auc = 0.0
+            self.walk_forward_auc = 0.0
+            self._metrics_match_model = False
+        # XGBoost and the Platt calibrator are companions to the live-outcome
+        # LightGBM model.  A forecast bootstrap model has different label
+        # semantics; loading these artifacts alongside it would silently ensemble
+        # incompatible probabilities after a restart.
+        live_model = self._model_file == os.path.basename(self._lgb_path())
+        if live_model and XGB_AVAILABLE and os.path.exists(self._xgb_path()):
             try:
                 self.xgb_model = joblib.load(self._xgb_path())
                 if getattr(self.xgb_model, "n_features_in_", N_FEATURES) != N_FEATURES:
@@ -147,18 +200,22 @@ class MLEngineGold:
                 else:
                     log.info("✓ XGBoost loaded")
             except Exception: log.info("XGBoost model unreadable — will retrain")
-        try:
-            platt = joblib.load(self._platt_path())
-            if getattr(platt, "n_features_in_", N_FEATURES) != N_FEATURES:
-                raise ValueError("feature-count mismatch")
-            self.platt_model = platt
-            log.info("✓ Platt calibrator loaded")
-        except Exception:
-            if ML_AVAILABLE:
-                self.platt_model = CalibratedClassifierCV(
-                    LogisticRegression(max_iter=1000, C=0.5, random_state=42),
-                    method="sigmoid",
-                )
+        if live_model:
+            try:
+                platt = joblib.load(self._platt_path())
+                if getattr(platt, "n_features_in_", N_FEATURES) != N_FEATURES:
+                    raise ValueError("feature-count mismatch")
+                self.platt_model = platt
+                log.info("✓ Platt calibrator loaded")
+            except Exception:
+                pass
+        # A fresh process may have no live model yet (or may have loaded only
+        # the forecast bootstrap), but train() still needs a new calibrator.
+        if self.platt_model is None and ML_AVAILABLE:
+            self.platt_model = CalibratedClassifierCV(
+                LogisticRegression(max_iter=1000, C=0.5, random_state=42),
+                method="sigmoid",
+            )
 
     # ── FEATURE LOGGING ───────────────────────────────────────────────────────
     def log_entry(self, features, side: str, entry_price: float) -> bool:
@@ -195,24 +252,35 @@ class MLEngineGold:
 
         rows = db.fetchall(
             "SELECT features_json, outcome, entry_time FROM training_data "
-            "WHERE outcome IS NOT NULL ORDER BY entry_time ASC"
+            "WHERE outcome IS NOT NULL AND entry_time IS NOT NULL "
+            "AND julianday(entry_time) IS NOT NULL "
+            "ORDER BY julianday(entry_time) ASC"
         )
-        n = len(rows)
-        if n < Config.MIN_TRAIN_SAMPLES:
-            log.info(f"[ML] Need {Config.MIN_TRAIN_SAMPLES} samples, have {n}")
-            return {"status": "insufficient_data", "n": n}
-
+        # Parse before sizing/splitting.  A corrupt or partially migrated row
+        # must not count toward the sample threshold or shift the temporal split
+        # away from the actual parsed data.
         X, y = [], []
         for row in rows:
             try:
                 feat = json.loads(row["features_json"])
-                X.append([feat.get(nm, 0.0) for nm in FEATURE_NAMES])
-                y.append(int(row["outcome"]))
-            except Exception:
+                if not isinstance(feat, dict):
+                    continue
+                values = [float(feat.get(nm, 0.0)) for nm in FEATURE_NAMES]
+                outcome = int(row["outcome"])
+                if outcome not in (0, 1) or not np.isfinite(values).all():
+                    continue
+                X.append(values)
+                y.append(outcome)
+            except (TypeError, ValueError, json.JSONDecodeError):
                 continue
 
-        X = np.array(X, dtype=np.float32)
-        y = np.array(y, dtype=np.int32)
+        n = len(X)
+        if n < Config.MIN_TRAIN_SAMPLES:
+            log.info(f"[ML] Need {Config.MIN_TRAIN_SAMPLES} samples, have {n}")
+            return {"status": "insufficient_data", "n": n}
+
+        X = np.asarray(X, dtype=np.float32)
+        y = np.asarray(y, dtype=np.int32)
 
         if len(np.unique(y)) < 2:
             log.warning("[ML] Single class in training data")
@@ -260,6 +328,7 @@ class MLEngineGold:
             callbacks=[lgb.early_stopping(50, verbose=False), lgb.log_evaluation(0)],
         )
         self.lgb_model.save_model(self._lgb_path())
+        self._model_file = os.path.basename(self._lgb_path())
 
         tr_pred  = self.lgb_model.predict(X_tr)
         val_pred = self.lgb_model.predict(X_val)
@@ -305,6 +374,7 @@ class MLEngineGold:
         )
 
         self._new_since_train = 0
+        self._metrics_match_model = True
         self._save_metrics()
         log.info(
             f"✓ Ensemble trained | n={n} | LGB_AUC={self.val_auc:.3f} "
@@ -326,15 +396,48 @@ class MLEngineGold:
         5-day labels straddle the boundary. Both inflated val_auc before."""
         if not ML_AVAILABLE:
             return {"status": "ml_not_available"}
-        X = np.asarray(X, dtype=np.float32)
-        y = np.asarray(y, dtype=np.int32)
+        # Validate and clean the prepared dataset before changing the currently
+        # usable model.  A failed forecast build should not disable a live model
+        # that was already serving predictions.
+        try:
+            X = np.asarray(X, dtype=np.float32)
+            y_raw = np.asarray(y, dtype=np.float64)
+        except (TypeError, ValueError):
+            return {"status": "invalid_dataset", "n": 0}
+        if X.ndim != 2 or X.shape[1] != N_FEATURES or y_raw.ndim != 1:
+            return {"status": "invalid_dataset", "n": int(len(X)) if X.ndim else 0}
+        if len(X) != len(y_raw):
+            return {"status": "invalid_dataset", "n": int(len(X))}
+        if ts is not None:
+            try:
+                if len(ts) != len(X):
+                    return {"status": "invalid_timestamps", "n": int(len(X))}
+            except TypeError:
+                return {"status": "invalid_timestamps", "n": int(len(X))}
+        valid = np.isfinite(X).all(axis=1) & np.isfinite(y_raw)
+        valid &= np.isin(y_raw, (0, 1))
+        if not valid.all():
+            X = X[valid]
+            y_raw = y_raw[valid]
+        y = y_raw.astype(np.int32)
         if len(X) < 200 or len(np.unique(y)) < 2:
             return {"status": "insufficient_data", "n": int(len(X))}
-        if ts is not None and len(ts) == len(X):
+        if ts is not None:
             import datetime as _dt
-            dates  = np.array([t.date() for t in ts], dtype=object)
+            ts_values = [t for t, keep in zip(ts, valid) if keep]
+            try:
+                dates = np.array([
+                    t.date() if hasattr(t, "date")
+                    else _dt.datetime.fromisoformat(str(t)).date()
+                    for t in ts_values
+                ], dtype=object)
+            except (TypeError, ValueError):
+                return {"status": "invalid_timestamps", "n": int(len(X))}
             uniq   = sorted(set(dates.tolist()))
-            cutoff = uniq[int(len(uniq) * 0.8)]          # 80th-percentile DATE
+            # Use the last date in the 80% training bucket.  Indexing the
+            # 80th-percentile date directly made a five-date dataset choose its
+            # final date as the cutoff and leave validation empty.
+            cutoff = uniq[max(0, int(len(uniq) * 0.8) - 1)]
             emb    = _dt.timedelta(days=embargo_days)
             tr_mask = np.array([d <= cutoff - emb for d in dates])
             va_mask = np.array([d > cutoff for d in dates])
@@ -349,6 +452,11 @@ class MLEngineGold:
             # exactly when quiet markets made the tail single-class.
             return {"status": "insufficient_data_after_split",
                     "n": int(len(X)), "train": int(len(X_tr)), "val": int(len(X_val))}
+        # A forward-return forecast has different label semantics from the live
+        # trade-outcome model. Never blend an already-loaded companion artifact
+        # with the forecast booster, including after a successful in-process train.
+        self.xgb_model = None
+        self.platt_model = None
         dtr  = lgb.Dataset(X_tr, y_tr, feature_name=FEATURE_NAMES)
         dval = lgb.Dataset(X_val, y_val, reference=dtr)
         self.lgb_model = lgb.train(
@@ -359,10 +467,12 @@ class MLEngineGold:
         # ★ Forecast/bootstrap model lives in its OWN file so it never clobbers the
         #   live-outcome model (lgb_gold.txt). See _load_models for precedence.
         self.lgb_model.save_model(self._forecast_path())
+        self._model_file = os.path.basename(self._forecast_path())
         self.feature_importance = self.lgb_model.feature_importance("gain")
         self.train_auc = float(roc_auc_score(y_tr,  self.lgb_model.predict(X_tr)))
         self.val_auc   = float(roc_auc_score(y_val, self.lgb_model.predict(X_val)))
         self.walk_forward_auc = 0.0   # train_on has no walk-forward pass
+        self._metrics_match_model = True
         self._save_metrics()
         top = sorted(zip(FEATURE_NAMES, self.feature_importance.tolist()), key=lambda x: -x[1])[:6]
         log.info(f"[ML] ★ Forecast model trained | n={len(X)} | val_AUC={self.val_auc:.3f} "
@@ -374,10 +484,12 @@ class MLEngineGold:
     # ── TRUST GATE ────────────────────────────────────────────────────────────
     def is_trustworthy(self) -> bool:
         """Whether the loaded model is good enough to blend into the decision.
-        Guards against trusting a known-overfit/low-AUC model at 60% weight. If we
-        have no recorded AUC (e.g. a fresh forecast model), we trust a loaded model
-        rather than disable ML entirely; a recorded AUC below the floor distrusts."""
+        Guards against trusting a known-overfit/low-AUC model at 60% weight. The
+        persisted metrics must belong to the model file that was loaded; an
+        untagged or mismatched artifact is treated as untrusted until retrained."""
         if self.lgb_model is None and self.xgb_model is None:
+            return False
+        if not self._metrics_match_model:
             return False
         # ★ Prefer the walk-forward number when it exists — it is the honest
         # (strictly out-of-time) metric. max() let a leaky random-split val_auc
@@ -390,16 +502,27 @@ class MLEngineGold:
     # ── INFERENCE ─────────────────────────────────────────────────────────────
     def predict(self, features) -> Tuple[float, float]:
         """Returns (probability, confidence). Ensemble when both models available."""
-        X = np.array([features.to_list()], dtype=np.float32)
+        try:
+            X = np.asarray([features.to_list()], dtype=np.float32)
+        except (TypeError, ValueError):
+            return 0.50, 0.0
+        if X.shape != (1, N_FEATURES) or not np.isfinite(X).all():
+            log.warning("[ML] Invalid feature vector — returning neutral probability")
+            return 0.50, 0.0
 
         lgb_prob, xgb_prob = None, None
 
         if self.lgb_model is not None:
-            lgb_prob = float(self.lgb_model.predict(X)[0])
+            try:
+                value = float(self.lgb_model.predict(X)[0])
+                lgb_prob = value if np.isfinite(value) else None
+            except Exception:
+                lgb_prob = None
 
         if XGB_AVAILABLE and Config.USE_ENSEMBLE and self.xgb_model is not None:
             try:
-                xgb_prob = float(self.xgb_model.predict_proba(X)[0][1])
+                value = float(self.xgb_model.predict_proba(X)[0][1])
+                xgb_prob = value if np.isfinite(value) else None
             except Exception:
                 pass
 
@@ -459,18 +582,43 @@ class MLEngineGold:
         bankroll: float,
         drawdown: float = 0.0,
         regime_mult: float = 1.0,
+        tp_pct: Optional[float] = None,
+        sl_pct: Optional[float] = None,
     ) -> Tuple[float, float]:
-        tp = Config.TAKE_PROFIT_PCT; sl = Config.STOP_LOSS_PCT
+        # Use the actual signal distances when available. ATR-based stops can
+        # differ materially from the legacy fixed 7%/3% assumptions; sizing on
+        # the wrong payoff ratio overstates Kelly for wide stops and understates
+        # it for tight targets.
+        tp = tp_pct if tp_pct is not None else Config.TAKE_PROFIT_PCT
+        sl = sl_pct if sl_pct is not None else Config.STOP_LOSS_PCT
+        try:
+            vals = (ml_prob, entry_quality, bankroll, drawdown, regime_mult, tp, sl)
+            if not all(np.isfinite(float(v)) for v in vals):
+                return 0.0, 0.0
+        except (TypeError, ValueError):
+            return 0.0, 0.0
+        # Kelly is undefined outside a probability/quality/risk domain. Reject
+        # malformed model output rather than letting an out-of-range probability
+        # or regime multiplier manufacture an oversized order.
+        if (not 0.0 < ml_prob < 1.0 or not 0.0 <= entry_quality <= 1.0
+                or bankroll <= 0 or drawdown < 0 or not 0.0 <= regime_mult <= 2.0
+                or tp <= 0 or sl <= 0):
+            return 0.0, 0.0
         if ml_prob <= 0.50: return 0.0, 0.0
         b = tp / sl; p = ml_prob; q = 1. - ml_prob
         raw_kelly = (p*b - q) / b
         if raw_kelly <= 0: return 0.0, 0.0
         kelly = raw_kelly * Config.KELLY_FRACTION
         kelly *= max(0.5, entry_quality)
-        kelly *= max(0.3, regime_mult)          # ★ regime adjustment
+        # Preserve defensive regime multipliers. A floor of 0.3 silently
+        # tripled high-fear sizing (0.10) and raised bear-high-vol sizing
+        # (0.25), defeating the regime policy. Extreme fear is blocked by the
+        # main loop, but zero remains a safe result if this helper is called
+        # directly.
+        kelly *= max(0.0, regime_mult)
         if drawdown > 0.05: kelly *= max(0.1, 1. - (drawdown-0.05)*6)
         size = kelly * bankroll
-        size = max(Config.MIN_POSITION_USD, min(size, Config.MAX_POSITION_USD))
+        size = min(size, Config.MAX_POSITION_USD)
         size = min(size, bankroll * Config.MAX_POSITION_PCT)
         return round(kelly, 5), round(size, 2)
 

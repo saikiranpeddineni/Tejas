@@ -15,6 +15,7 @@ Run standalone:   python forecast_trainer.py
 Or from the dashboard's  🧠 Train  button.
 """
 import logging
+import math
 
 from config import Config
 from models import Quote
@@ -34,6 +35,9 @@ def _synthetic_quote(sym: str, close: float, ts) -> Quote:
 
 def build_dataset(broker, builder, symbols, horizon=5, max_symbols=200,
                   step=2, hist=420, up_threshold=0.005):
+    if horizon < 1 or step < 1 or hist < 1:
+        log.warning("[Forecast] invalid horizon/step/history — no dataset built")
+        return [], [], []
     # ts = each row's window-end timestamp, so the trainer can split by DATE.
     # Rows are appended symbol-block by symbol-block, so a row-index split is a
     # symbol split (all dates on both sides) — see MLEngineGold.train_on.
@@ -53,7 +57,12 @@ def build_dataset(broker, builder, symbols, horizon=5, max_symbols=200,
             feats = builder.build(sym, window, q)
             if feats is None:
                 continue
-            fwd = (bars[t + horizon].close - bars[t].close) / bars[t].close
+            base_close = float(bars[t].close)
+            future_close = float(bars[t + horizon].close)
+            if (not math.isfinite(base_close) or not math.isfinite(future_close)
+                    or base_close <= 0 or future_close <= 0):
+                continue
+            fwd = (future_close - base_close) / base_close
             X.append(feats.to_list())
             y.append(1 if fwd > up_threshold else 0)
             ts.append(window[-1].timestamp)

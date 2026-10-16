@@ -32,6 +32,10 @@ log = logging.getLogger(__name__)
 IST = timezone(timedelta(hours=5, minutes=30))
 
 
+def _today_ist() -> date:
+    return datetime.now(IST).date()
+
+
 class EarningsFilter:
     def __init__(self):
         # Cache: symbol → (earnings_date, fetched_at, ok)
@@ -52,7 +56,7 @@ class EarningsFilter:
         if next_date is None:
             return False   # unknown = allow (can't block indefinitely)
 
-        today = date.today()
+        today = _today_ist()
         days_to = (next_date - today).days
 
         if days_to < 0:
@@ -79,12 +83,30 @@ class EarningsFilter:
         diff_secs = (earnings_dt - now_ist).total_seconds()
         return diff_secs / 60.0
 
-    def should_exit_before_earnings(self, symbol: str) -> bool:
+    def should_exit_before_earnings(self, symbol: str, *, fetch: bool = True) -> bool:
         """
         Returns True if we should exit an existing position
         (within EARNINGS_EXIT_BEFORE_MINS minutes of earnings).
         """
-        mins = self.minutes_to_earnings(symbol)
+        if fetch:
+            mins = self.minutes_to_earnings(symbol)
+        else:
+            # Exit monitoring must not block the stop loop on a fresh Yahoo
+            # request for every open position. The scanner pre-pass warms this
+            # cache; an uncached symbol is checked on the next scan cycle.
+            cached = self._cache.get(symbol)
+            if not cached:
+                return False
+            next_date, fetched_at, ok = cached
+            ttl = self._cache_ttl if ok else self._fail_ttl
+            if time.time() - fetched_at >= ttl:
+                return False
+            if next_date is None:
+                return False
+            earnings_dt = datetime.combine(next_date, datetime.min.time()).replace(
+                hour=16, minute=0, tzinfo=IST
+            )
+            mins = (earnings_dt - datetime.now(IST)).total_seconds() / 60.0
         if mins is None:
             return False
         return 0 < mins <= Config.EARNINGS_EXIT_BEFORE_MINS
@@ -94,7 +116,7 @@ class EarningsFilter:
         next_date = self._get_next_earnings(symbol)
         if next_date is None:
             return None
-        return (next_date - date.today()).days
+        return (next_date - _today_ist()).days
 
     # ── FETCH ─────────────────────────────────────────────────────────────────
     def _get_next_earnings(self, symbol: str) -> Optional[date]:
@@ -109,7 +131,7 @@ class EarningsFilter:
 
         earnings_date, ok = self._fetch_from_yahoo(symbol)
         if not ok:
-            log.warning(f"[Earnings] {symbol}: fetch failed — gate inactive, retry in {self._fail_ttl//60}min")
+            log.debug(f"[Earnings] {symbol}: fetch failed — gate inactive, retry in {self._fail_ttl//60}min")
         self._cache[symbol] = (earnings_date, time.time(), ok)
         return earnings_date
 
@@ -128,7 +150,7 @@ class EarningsFilter:
                    .get("earnings", {})
                    .get("earningsDate", [])
             )
-            today = date.today()
+            today = _today_ist()
             future = []
             for d in dates:
                 raw = d.get("raw") if isinstance(d, dict) else None
@@ -163,10 +185,11 @@ class EarningsFilter:
         blackout = set()
         start = time.time()
         consec_fail = 0
+        failed = 0
+        stopped_early = False
         for i, sym in enumerate(symbols):
             if time.time() - start > time_budget_secs:
-                log.warning(f"[Earnings] pre-pass time budget hit at {i}/{len(symbols)} "
-                            f"symbols — gate inactive for the rest this cycle")
+                stopped_early = True
                 break
             try:
                 if self.is_blackout(sym):
@@ -176,14 +199,19 @@ class EarningsFilter:
                 # circuit breaker: count fetches that FAILED (ok=False in cache)
                 ent = self._cache.get(sym)
                 if ent is not None and ent[2] is False:
+                    failed += 1
                     consec_fail += 1
                     if consec_fail >= max_consecutive_failures:
-                        log.warning(f"[Earnings] {consec_fail} consecutive fetch failures "
-                                    f"— feed looks down; skipping remaining "
-                                    f"{len(symbols) - i - 1} symbols this cycle")
+                        stopped_early = True
                         break
                 else:
                     consec_fail = 0
             except Exception:
-                pass
+                failed += 1
+        if stopped_early:
+            log.warning(f"[Earnings] blackout pre-pass stopped early at {len(self._cache)}/{len(symbols)} "
+                        f"symbols; unchecked names fail open for this cycle")
+        if failed:
+            log.warning(f"[Earnings] {failed} calendar fetches failed; gate inactive for those names "
+                        f"(retry in {self._fail_ttl//60}min)")
         return blackout

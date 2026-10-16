@@ -5,7 +5,7 @@ Market DATA (bars/quotes, hence regime + features) comes from Yahoo by default,
 so every live adapter only has to implement the trading-critical hooks:
 
     _account_info()         -> dict (cash, buying_power, portfolio_value)
-    _place_entry(sym,side,qty) -> dict with "id"
+    _place_entry(sym,side,qty,client_order_id) -> dict with "id"
     _flatten(symbol)        -> dict
     _positions()            -> List[dict]
 
@@ -33,8 +33,10 @@ def _extract_error(body) -> Optional[str]:
     Zerodha/Upstox {status:"error",message,error_type} or {errors:[...]}."""
     if not isinstance(body, dict):
         return None
-    st = body.get("status")
+    st = body.get("status", body.get("s"))
     is_err = (st is False) or (isinstance(st, str) and st.lower() in ("error", "false"))
+    if body.get("success") is False:
+        is_err = True
     # Upstox: {"status":"error","errors":[{"message":...,"errorCode":...}]}
     errs = body.get("errors")
     if not is_err and not errs:
@@ -42,8 +44,8 @@ def _extract_error(body) -> Optional[str]:
     if isinstance(errs, list) and errs:
         e0 = errs[0] if isinstance(errs[0], dict) else {}
         return str(e0.get("message") or e0.get("errorCode") or errs)
-    return str(body.get("message") or body.get("error_type")
-               or body.get("errorcode") or body.get("error") or body)
+    return str(body.get("message") or body.get("errmsg") or body.get("error_type")
+               or body.get("errorcode") or body.get("code") or body.get("error") or body)
 
 
 class LiveBrokerBase(BaseBroker):

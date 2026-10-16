@@ -17,6 +17,7 @@ candidates per scan, NOT the 500-symbol universe loop — results are cached
 can't disarm the gate all day (mirrors EarningsFilter).
 """
 import logging
+import math
 import time
 from typing import Dict, Optional
 
@@ -37,7 +38,9 @@ def _raw(node: Optional[dict], *keys):
         cur = cur.get(k)
     if isinstance(cur, dict):
         cur = cur.get("raw")
-    return cur if isinstance(cur, (int, float)) else None
+    if isinstance(cur, bool) or not isinstance(cur, (int, float)):
+        return None
+    return float(cur) if math.isfinite(float(cur)) else None
 
 
 class FundamentalsEngine:

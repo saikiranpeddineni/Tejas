@@ -7,6 +7,7 @@ Computes professional-grade metrics from the trades table:
   Equity curve for charting
 """
 import logging
+import math
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
@@ -63,11 +64,27 @@ class PerformanceAnalytics:
             SELECT trade_id, symbol, side, size_usd, entry_price, exit_price,
                    ml_probability, entry_quality, kelly_pct, pnl_usd, pnl_pct,
                    entry_time, exit_time, exit_reason, sector_code
-            FROM trades WHERE status='closed' AND entry_time >= ?
+            FROM trades
+            WHERE status='closed' AND entry_time IS NOT NULL
+              AND pnl_usd IS NOT NULL AND pnl_pct IS NOT NULL
+              AND julianday(entry_time) IS NOT NULL
+              AND julianday(entry_time) >= julianday(?)
             ORDER BY entry_time ASC
             """,
             (cutoff,),
         )
+        # Legacy rows can contain NULL/text/NaN P&L even when status says closed.
+        # Exclude those rows rather than letting one corrupt record abort the
+        # entire dashboard report or poison numpy metrics.
+        valid_rows = []
+        for row in rows:
+            try:
+                if (math.isfinite(float(row["pnl_pct"]))
+                        and math.isfinite(float(row["pnl_usd"]))):
+                    valid_rows.append(row)
+            except (TypeError, ValueError):
+                continue
+        rows = valid_rows
         if not rows:
             return FullReport(
                 generated_at=datetime.now(timezone.utc),
@@ -125,10 +142,22 @@ class PerformanceAnalytics:
         # max(cumulative_pnl) + 10000 — an arbitrary constant with no financial
         # meaning that systematically understated the drawdown percentage.
         cumul   = np.cumsum(pnl_usd)
-        equity  = Config.BANKROLL + cumul
+        try:
+            base_equity = float(Config.BANKROLL)
+        except (TypeError, ValueError):
+            base_equity = 0.0
+        if not math.isfinite(base_equity) or base_equity < 0:
+            base_equity = 0.0
+        equity  = base_equity + cumul
         run_max = np.maximum.accumulate(equity)
         dds     = run_max - equity                       # ₹ drawdown from running peak equity
-        dd_pct  = dds / run_max                           # fractional drawdown at each point
+        # Do not divide by a zero/negative peak if corrupted data exceeds the
+        # configured bankroll.  Such a path is already a complete loss; report a
+        # bounded 100% drawdown instead of NaN/negative percentages.
+        dd_pct = np.zeros_like(dds, dtype=float)
+        positive_peak = run_max > 0
+        dd_pct[positive_peak] = dds[positive_peak] / run_max[positive_peak]
+        dd_pct[~positive_peak] = np.where(dds[~positive_peak] > 0, 1.0, 0.0)
         max_dd  = float(np.max(dds)) if len(dds) else 0.0
         calmar  = sum(pnl_usd) / max_dd if max_dd > 0 else 0.0
         return RiskMetrics(
@@ -142,7 +171,11 @@ class PerformanceAnalytics:
         codes = {0:"technology",1:"finance",2:"healthcare",3:"consumer",4:"energy",5:"etf",6:"other"}
         data: Dict[str, dict] = {}
         for r in rows:
-            sec = codes.get(int(r["sector_code"] or 6), "other")
+            try:
+                code = int(r["sector_code"] or 6)
+            except (TypeError, ValueError):
+                code = 6
+            sec = codes.get(code, "other")
             if sec not in data:
                 data[sec] = {"pnl_pct":[],"pnl_usd":[],"win":[]}
             pnl = float(r["pnl_usd"] or 0)
