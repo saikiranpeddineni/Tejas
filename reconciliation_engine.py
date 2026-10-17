@@ -19,6 +19,29 @@ class ReconciliationEngine:
         self._last_alert_sig = None   # suppress identical drift spam (re-alert hourly)
         self._last_alert_ts = 0.0
         self._last_failure_alert_ts = 0.0
+        self._last_reconcile_ok = False
+        self._last_reconcile_at = 0.0
+        self._last_drift = False
+
+    def entries_safe(self, max_age_secs: float = None) -> bool:
+        """Whether the broker book was recently verified against the ledger.
+
+        New live risk must not be added before the first successful comparison,
+        after a position drift, or while reconciliation has gone stale. Existing
+        positions remain on the independent monitor/exit path.
+        """
+        if not self._running or not self._last_reconcile_ok or self._last_drift:
+            return False
+        try:
+            limit = float(max_age_secs) if max_age_secs is not None else self.interval_secs * 2.0
+            age = time.time() - self._last_reconcile_at
+            return math.isfinite(limit) and limit > 0 and 0 <= age <= limit
+        except (TypeError, ValueError, OverflowError):
+            return False
+
+    def _mark_failure(self) -> None:
+        self._last_reconcile_ok = False
+        self._last_reconcile_at = 0.0
 
     def start(self):
         if self._running:
@@ -68,9 +91,11 @@ class ReconciliationEngine:
             # would create a false "missing at broker" alert (or hide a real
             # position) and would train operators to ignore drift notifications.
             log.warning("[Reconciliation] Position fetch unavailable; retrying next round")
+            self._mark_failure()
             return
         if broker_positions is None:
             log.warning("[Reconciliation] Broker returned no position payload; retrying next round")
+            self._mark_failure()
             return
 
         # Build maps for comparison. NSE trades whole shares: compare INTEGERS
@@ -80,6 +105,7 @@ class ReconciliationEngine:
         for position in broker_positions:
             if not isinstance(position, dict):
                 log.warning("[Reconciliation] Position payload contained a non-object; retrying next round")
+                self._mark_failure()
                 return
             symbol = position.get("symbol")
             if not symbol:
@@ -88,9 +114,11 @@ class ReconciliationEngine:
                 qty = float(position.get("qty", 0) or 0)
             except (TypeError, ValueError):
                 log.warning("[Reconciliation] Position payload contained a non-numeric quantity; retrying next round")
+                self._mark_failure()
                 return
             if not math.isfinite(qty):
                 log.warning("[Reconciliation] Position payload contained a non-finite quantity; retrying next round")
+                self._mark_failure()
                 return
             broker_map[symbol] = broker_map.get(symbol, 0.0) + qty
 
@@ -133,6 +161,9 @@ class ReconciliationEngine:
                 drift_messages.append(msg)
 
         if drift_detected:
+            self._last_reconcile_ok = True
+            self._last_reconcile_at = time.time()
+            self._last_drift = True
             sig = tuple(sorted(drift_messages))
             now = time.time()
             if sig == self._last_alert_sig and (now - self._last_alert_ts) < 3600:
@@ -142,5 +173,8 @@ class ReconciliationEngine:
             log.warning(f"[Reconciliation] Drift detected between local state and broker: {drift_messages}")
             alert_system_message("⚠️ Position drift detected\n" + "\n".join(drift_messages))
         else:
+            self._last_reconcile_ok = True
+            self._last_reconcile_at = time.time()
+            self._last_drift = False
             self._last_alert_sig = None
             log.debug("[Reconciliation] Local portfolio matches broker perfectly.")

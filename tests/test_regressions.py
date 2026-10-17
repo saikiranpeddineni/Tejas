@@ -407,6 +407,34 @@ class BrokerBoundaryTests(unittest.TestCase):
         self.assertEqual(result["qty"], 0)
         self.assertFalse(broker._validate_order_result(result, requested_qty=10))
 
+    def test_unresolved_live_order_blocks_duplicate_until_status_is_known(self):
+        from brokers.live_base import LiveBrokerBase
+
+        broker = object.__new__(LiveBrokerBase)
+        BaseBroker.__init__(broker)
+        broker.ORDER_STATUS_POLL_INTERVAL = 0
+        broker.ORDER_STATUS_POLL_TIMEOUT = 0
+        broker.ORDER_STATUS_MAX_POLLS = 1
+        broker._order_status = mock.Mock(side_effect=[
+            {"id": "live-3", "status": "open", "filled_quantity": 0},
+            {"id": "live-3", "status": "open", "filled_quantity": 0},
+            {
+                "id": "live-3",
+                "status": "complete",
+                "filled_quantity": 10,
+                "average_price": 101.0,
+            },
+        ])
+
+        first = broker._confirm_order("live-3", "INFY", "buy", 10, "tj_test")
+        blocked = broker._resolve_unresolved_order("INFY", "buy", requested_qty=10)
+        resolved = broker._resolve_unresolved_order("INFY", "buy", requested_qty=10)
+
+        self.assertTrue(first["unsafe"])
+        self.assertTrue(blocked["unsafe"])
+        self.assertEqual(resolved["status"], "filled")
+        self.assertEqual(broker._order_status.call_count, 3)
+
     def test_live_flatten_partial_fill_is_not_reported_as_flat(self):
         from brokers.live_base import LiveBrokerBase
 
@@ -694,6 +722,43 @@ class DatabaseRegressionTests(unittest.TestCase):
             for row in self.db._get_conn().execute("PRAGMA table_info(trades)")
         }
         self.assertTrue({"highest_price", "trim_shares", "trim_price", "rationale"} <= columns)
+        broker_order_columns = {
+            row[1]
+            for row in self.db._get_conn().execute("PRAGMA table_info(broker_orders)")
+        }
+        self.assertTrue({"order_id", "status", "filled_avg_price"} <= broker_order_columns)
+
+    def test_unresolved_live_order_state_survives_restart(self):
+        from brokers.live_base import LiveBrokerBase
+
+        def make_broker():
+            broker = object.__new__(LiveBrokerBase)
+            BaseBroker.__init__(broker)
+            broker._order_persistence_enabled = True
+            broker._unresolved_orders = {}
+            broker._unresolved_orders_loaded = False
+            broker.ORDER_STATUS_POLL_INTERVAL = 0
+            broker.ORDER_STATUS_POLL_TIMEOUT = 0
+            broker.ORDER_STATUS_MAX_POLLS = 1
+            return broker
+
+        first = make_broker()
+        first._order_status = mock.Mock(return_value={
+            "id": "persisted-1", "status": "open", "filled_quantity": 0,
+        })
+        result = first._confirm_order("persisted-1", "INFY", "buy", 10, "tj_persist")
+        self.assertTrue(result["unsafe"])
+
+        row = self.db.fetchone(
+            "SELECT status, symbol, requested_qty FROM broker_orders WHERE order_id=?",
+            ("persisted-1",),
+        )
+        self.assertEqual((row["status"], row["symbol"], row["requested_qty"]),
+                         ("timeout", "INFY", 10))
+
+        restored = make_broker()
+        restored._load_unresolved_orders()
+        self.assertIn("persisted-1", restored._unresolved_orders)
 
         self.db.execute(
             "INSERT INTO portfolio_snapshots(snap_date, bankroll, open_trades, total_pnl) "
@@ -902,11 +967,13 @@ class ReconciliationTests(unittest.TestCase):
             broker.values = [{"symbol": "INFY", "qty": 8.4}]
             engine.reconcile()
             telegram.alert_system_message.assert_not_called()
+            self.assertTrue(engine.entries_safe())
 
             broker.values = [{"symbol": "INFY", "qty": 7}]
             engine.reconcile()
             engine.reconcile()
             self.assertEqual(telegram.alert_system_message.call_count, 1)
+            self.assertFalse(engine.entries_safe())
 
             # [] is treated as an unavailable fetch, not as a confirmed flat book
             # when the adapter reports that the fetch failed.
@@ -914,6 +981,7 @@ class ReconciliationTests(unittest.TestCase):
             broker._last_positions_ok = False
             engine.reconcile()
             self.assertEqual(telegram.alert_system_message.call_count, 1)
+            self.assertFalse(engine.entries_safe())
         finally:
             sys.modules.pop("reconciliation_engine", None)
             if old_recon is not None:

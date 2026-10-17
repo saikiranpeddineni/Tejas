@@ -124,6 +124,9 @@ network access.
 - Open trades are restored from SQLite on restart. Reconciliation compares the
   broker's net positions with the local ledger and does not treat a failed
   position fetch as a flat account.
+- The broker-order ledger records live submissions whose final status is unknown.
+  A restart restores those rows, polls them before allowing another order for the
+  symbol, and blocks new live entries until the broker book has been reconciled.
 - Software SL/TP cannot protect a position while the process, host, or required
   feed is down; there is no exchange-side protection created by these safeguards.
   The bot writes a bounded heartbeat, blocks new live entries after an unhealthy

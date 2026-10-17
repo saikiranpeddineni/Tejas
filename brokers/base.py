@@ -328,6 +328,16 @@ class BaseBroker:
         if qty < 1:
             log.warning(f"[{self.name}] {symbol}: notional ₹{notional:.0f} < 1 share — skipped")
             return None
+        existing = self._resolve_unresolved_order(symbol, side, requested_qty=qty)
+        if existing is not None:
+            # The broker's prior order already owns its original quantity. Do
+            # not compare that confirmed fill with the size of this new signal;
+            # a different signal size must never cause a known fill to be lost.
+            if self._validate_order_result(existing):
+                log.info(f"[{self.name}] Resolved prior order for {symbol}; no duplicate POST sent")
+                return existing
+            log.warning(f"[{self.name}] {symbol} has an unresolved prior order; new order blocked")
+            return None
         # Keep the identifier short enough for broker order-tag fields while
         # retaining enough entropy to correlate an ambiguous response.
         client_order_id = self._new_client_order_id()
@@ -435,6 +445,16 @@ class BaseBroker:
         require a confirmed terminal fill with quantity and price.
         """
         return True
+
+    def _resolve_unresolved_order(self, symbol: str, side: str,
+                                  requested_qty: Optional[int] = None) -> Optional[dict]:
+        """Return a previously unresolved result, if the broker supports it.
+
+        Live adapters use this hook to prevent a second order POST after a
+        timeout or lost status response. Paper brokers have no unresolved live
+        order state and keep the default no-op behavior.
+        """
+        return None
 
     # ════════════════════════════════════════════════════════════════════════
     # POSITIONS

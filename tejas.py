@@ -867,6 +867,14 @@ def main() -> None:
     from reconciliation_engine import ReconciliationEngine
     recon_engine = ReconciliationEngine(broker, portfolio)
     recon_engine.start()
+    # Verify the broker book synchronously before the first live-entry decision.
+    # The background interval is intentionally long for rate-limit discipline,
+    # but waiting five minutes before detecting an external/manual position is
+    # unsafe.
+    try:
+        recon_engine.reconcile()
+    except Exception as exc:
+        log.error("[Main] Initial reconciliation failed: %s", type(exc).__name__, exc_info=True)
 
     # ── Startup Telegram alert ─────────────────────────────────────────────
     telegram_alerts.alert_system_start(portfolio.bankroll, Config.PAPER_TRADING)
@@ -1029,6 +1037,8 @@ def main() -> None:
                 entry_block_reason = "first cycle after an offline monitoring gap"
             elif Config.LIVE_MODE and not heartbeat_healthy:
                 entry_block_reason = "heartbeat health is outside its bound"
+            elif Config.LIVE_MODE and not recon_engine.entries_safe():
+                entry_block_reason = "broker reconciliation is missing, stale, or drifted"
             elif not account_ok:
                 entry_block_reason = "live account value unavailable"
             elif _feed_stale(broker):

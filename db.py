@@ -74,6 +74,25 @@ CREATE TABLE IF NOT EXISTS trades (
 CREATE INDEX IF NOT EXISTS idx_trades_status ON trades (status);
 CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades (symbol);
 
+-- Live broker orders whose final status may arrive after the HTTP placement
+-- response. Pending/unknown rows prevent a second POST for the same symbol and
+-- survive a process restart so they can be reconciled before new risk is added.
+CREATE TABLE IF NOT EXISTS broker_orders (
+    order_id          TEXT PRIMARY KEY,
+    broker            TEXT NOT NULL,
+    symbol            TEXT NOT NULL,
+    side              TEXT NOT NULL,
+    requested_qty     INTEGER NOT NULL,
+    client_order_id   TEXT DEFAULT '',
+    status            TEXT NOT NULL,
+    filled_qty        REAL,
+    filled_avg_price  REAL,
+    created_at        TEXT NOT NULL DEFAULT (datetime('now','utc')),
+    updated_at        TEXT NOT NULL DEFAULT (datetime('now','utc'))
+);
+CREATE INDEX IF NOT EXISTS idx_broker_orders_pending
+    ON broker_orders (broker, symbol, status);
+
 -- ML model metrics
 CREATE TABLE IF NOT EXISTS model_metrics (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,

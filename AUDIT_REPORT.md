@@ -12,6 +12,7 @@ The audit traced the critical flows from configuration and market-data ingestion
 
 - Broker adapters now share client-order IDs, reject malformed/error envelopes, avoid automatic POST retries, require broker order IDs, and fail closed on account/position/quote failures.
 - Live adapters now poll their read-only order-status endpoints after submission and expose a fill only after a terminal filled/traded state contains a valid whole-share quantity and average price. Rejected, cancelled, expired, unknown, timed-out, mismatched, or partial flatten responses remain unsafe and cannot be booked as a completed local trade.
+- Unresolved live orders are written to the new `broker_orders` table. Their status is restored after restart and polled before another order for the symbol can be submitted, preventing duplicate orders after a lost placement/status response.
 - Live flattening no longer treats a failed position lookup as an already-flat account.
 - Orders and staged exits use whole-share quantities and broker-reported fills where available; malformed or fractional position data cannot create a local position. `DRY_RUN=true` is now observation-only and cannot create hypothetical ledger trades or P&L.
 - Risk sizing no longer inflates a capped order back to the minimum. Kelly sizing uses each signal's actual stop/target distances, preserves defensive regime multipliers, and rejects invalid probability/risk inputs.
@@ -34,6 +35,7 @@ The audit traced the critical flows from configuration and market-data ingestion
 - Dashboard output and Telegram messages escape external/model text. Credential files are allowlisted, atomically written with restrictive permissions, and only the selected broker's credentials are passed to its child process. Telegram errors do not log bot-token URLs.
 - Dashboard polling tails only a bounded log window, startup diagnostics are capped, and scheduler/reconciliation shutdown is interruptible. Forecast-model status checks the forecast artifact, and unattended live-broker selections are downgraded to dry-run before credential validation.
 - Live entries require `DRY_RUN=false`, an explicit live acknowledgement, enabled earnings/sentiment/fundamental gates, normal market-hours mode, fresh feed data, and a healthy heartbeat. Missing or stale live-entry data blocks new risk while restored positions remain monitorable and exitable. Dashboard manual starts require a one-shot typed acknowledgement; persisted auto-start settings cannot arm live orders by themselves.
+- Live entries also require a recent successful broker-to-ledger reconciliation with no position drift. The first comparison runs synchronously before the main loop can open risk; later outages, stale checks, or drift disable new live entries while exits continue.
 - The watchdog now performs a bounded HTTP health read, and dashboard-owned bot children are recycled after a stale heartbeat. Heartbeat writes are atomic and durable enough to avoid treating a torn marker as healthy.
 - The old unbounded log handler is now rotating. Runtime state, local credentials, databases, logs, and generated model outputs are ignored for new commits.
 - Reproducibility files were added: `.python-version`, pinned `requirements.lock`, `Dockerfile`, `.dockerignore`, `.env.example`, `Makefile`, and setup/run/test/deploy/recovery documentation in `README.md`.
@@ -42,7 +44,7 @@ The audit traced the critical flows from configuration and market-data ingestion
 
 Commands run from the repository root:
 
-- `make test` — passed; 35 deterministic offline regression tests.
+- `make test` — passed; 38 deterministic offline regression tests.
 - `python -m unittest discover -s tests -p 'test*.py' -v` — passed.
 - `.venv/bin/python -m unittest discover -s tests -p 'test*.py' -v` — passed.
 - `python -m compileall -q .` — passed.
