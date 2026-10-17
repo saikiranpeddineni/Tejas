@@ -287,6 +287,16 @@ class BrokerBoundaryTests(unittest.TestCase):
         self.assertIsNotNone(quote)
         self.assertEqual(quote.timestamp, datetime.fromtimestamp(0, tz=UTC))
 
+    def test_exit_monitor_rejects_stale_quotes(self):
+        from brokers.base import quote_is_fresh
+        from models import Quote
+
+        fresh = Quote("INFY", 99.0, 101.0, 1, 1, datetime.now(UTC))
+        stale = Quote("INFY", 99.0, 101.0, 1, 1, datetime.fromtimestamp(0, tz=UTC))
+
+        self.assertTrue(quote_is_fresh(fresh))
+        self.assertFalse(quote_is_fresh(stale))
+
     def test_market_order_uses_whole_shares_and_client_order_id(self):
         from models import Quote
 
@@ -318,6 +328,115 @@ class BrokerBoundaryTests(unittest.TestCase):
                 inspect.signature(cls._place_entry).parameters,
                 msg=f"{class_name} does not accept BaseBroker's order id",
             )
+
+    def test_live_adapter_status_payloads_normalize_to_confirmed_fills(self):
+        cases = (
+            ("brokers.zerodha", "ZerodhaBroker", {
+                "data": [{"order_id": "1", "status": "COMPLETE",
+                           "filled_quantity": 3, "average_price": 100}],
+            }),
+            ("brokers.upstox", "UpstoxBroker", {
+                "data": {"order_id": "1", "status": "complete",
+                          "filled_quantity": 3, "average_price": 100},
+            }),
+            ("brokers.angelone", "AngelOneBroker", {
+                "data": {"orderid": "1", "orderstatus": "complete",
+                          "filledshares": "3", "averageprice": "100"},
+            }),
+            ("brokers.dhan", "DhanBroker", {
+                "orderId": "1", "orderStatus": "TRADED",
+                "filledQty": 3, "averageTradedPrice": 100,
+            }),
+            ("brokers.fyers", "FyersBroker", {
+                "orderBook": [{"id": "1", "status": 2,
+                                "filledQty": 3, "avgPrice": 100}],
+            }),
+        )
+        for module_name, class_name, payload in cases:
+            cls = getattr(importlib.import_module(module_name), class_name)
+            adapter = object.__new__(cls)
+            adapter._get = mock.Mock(return_value=payload)
+            status = adapter._order_status("1", "tj_test")
+            self.assertEqual(status["status"], "filled", msg=class_name)
+            self.assertEqual(status["filled_qty"], 3, msg=class_name)
+            self.assertEqual(status["filled_avg_price"], 100, msg=class_name)
+
+    def test_live_order_is_not_booked_until_terminal_fill_is_confirmed(self):
+        from brokers.live_base import LiveBrokerBase
+
+        broker = object.__new__(LiveBrokerBase)
+        BaseBroker.__init__(broker)
+        broker.ORDER_STATUS_POLL_INTERVAL = 0
+        broker.ORDER_STATUS_POLL_TIMEOUT = 1
+        broker.ORDER_STATUS_MAX_POLLS = 3
+        broker._order_status = mock.Mock(side_effect=[
+            {"id": "live-1", "status": "open", "filled_quantity": 0},
+            {
+                "id": "live-1",
+                "status": "complete",
+                "filled_quantity": 10,
+                "average_price": 101.25,
+            },
+        ])
+
+        result = broker._confirm_order("live-1", "INFY", "buy", 10, "tj_test")
+
+        self.assertEqual(result["status"], "filled")
+        self.assertEqual(result["qty"], 10)
+        self.assertEqual(result["filled_avg_price"], 101.25)
+        self.assertEqual(broker._order_status.call_count, 2)
+
+    def test_live_rejection_and_invalid_fill_fail_closed(self):
+        from brokers.live_base import LiveBrokerBase
+
+        broker = object.__new__(LiveBrokerBase)
+        BaseBroker.__init__(broker)
+        broker.ORDER_STATUS_POLL_INTERVAL = 0
+        broker.ORDER_STATUS_POLL_TIMEOUT = 0
+        broker.ORDER_STATUS_MAX_POLLS = 1
+        broker._order_status = mock.Mock(return_value={
+            "id": "live-2",
+            "status": "rejected",
+            "filled_quantity": 10,
+            "average_price": 101.25,
+        })
+
+        result = broker._confirm_order("live-2", "INFY", "buy", 10, "tj_test")
+
+        self.assertTrue(result["unsafe"])
+        self.assertEqual(result["qty"], 0)
+        self.assertFalse(broker._validate_order_result(result, requested_qty=10))
+
+    def test_live_flatten_partial_fill_is_not_reported_as_flat(self):
+        from brokers.live_base import LiveBrokerBase
+
+        broker = object.__new__(LiveBrokerBase)
+        BaseBroker.__init__(broker)
+        broker._positions = mock.Mock(return_value=[{"symbol": "INFY", "qty": 10}])
+        broker._place_entry = mock.Mock(return_value={
+            "id": "close-1",
+            "status": "filled",
+            "qty": 4,
+            "filled_avg_price": 99.0,
+        })
+
+        result = broker._flatten_position("INFY")
+
+        self.assertTrue(result["unsafe"])
+        self.assertEqual(result["qty"], 0)
+        self.assertEqual(broker._place_entry.call_args.kwargs["client_order_id"][:3], "tj_")
+
+    def test_live_flatten_rejects_fractional_position_payloads(self):
+        from brokers.live_base import LiveBrokerBase
+
+        broker = object.__new__(LiveBrokerBase)
+        BaseBroker.__init__(broker)
+        broker._positions = mock.Mock(return_value=[{"symbol": "INFY", "qty": 10.5}])
+        broker._place_entry = mock.Mock()
+
+        with self.assertRaises(RuntimeError):
+            broker._flatten_position("INFY")
+        broker._place_entry.assert_not_called()
 
 
 class MarketTimeTests(unittest.TestCase):
@@ -488,6 +607,64 @@ class RiskGateTests(unittest.TestCase):
         self.assertEqual(risk._daily_pnl, -250.0)
         self.assertEqual(risk._daily_pnl_date, broker.now.date())
         self.assertIn("INFY", risk._recent_exits)
+
+
+class LiveSafetyGateTests(unittest.TestCase):
+    def setUp(self):
+        self._values = {
+            name: getattr(Config, name)
+            for name in (
+                "BROKER",
+                "DRY_RUN",
+                "ENABLE_LIVE_TRADING",
+                "LIVE_TRADING_ACK",
+                "IGNORE_MARKET_HOURS",
+                "USE_EARNINGS_GATE",
+                "USE_SENTIMENT_GATE",
+                "USE_FUNDAMENTALS_GATE",
+                "PAPER_TRADING",
+            )
+        }
+        Config.BROKER = "zerodha"
+        Config.DRY_RUN = False
+        Config.PAPER_TRADING = False
+        Config.ENABLE_LIVE_TRADING = False
+        Config.LIVE_TRADING_ACK = ""
+        Config.IGNORE_MARKET_HOURS = False
+        Config.USE_EARNINGS_GATE = True
+        Config.USE_SENTIMENT_GATE = True
+        Config.USE_FUNDAMENTALS_GATE = True
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        for name, value in self._values.items():
+            setattr(Config, name, value)
+
+    def test_live_entries_require_explicit_acknowledgement(self):
+        allowed, reason = Config.live_entry_status()
+        self.assertFalse(allowed)
+        self.assertIn("ENABLE_LIVE_TRADING", reason)
+
+        Config.ENABLE_LIVE_TRADING = True
+        Config.LIVE_TRADING_ACK = Config.LIVE_TRADING_ACK_TEXT
+        allowed, reason = Config.live_entry_status()
+        self.assertTrue(allowed)
+        self.assertEqual(reason, "enabled")
+
+    def test_live_entries_reject_test_mode_or_disabled_data_gates(self):
+        Config.ENABLE_LIVE_TRADING = True
+        Config.LIVE_TRADING_ACK = Config.LIVE_TRADING_ACK_TEXT
+
+        Config.IGNORE_MARKET_HOURS = True
+        allowed, reason = Config.live_entry_status()
+        self.assertFalse(allowed)
+        self.assertIn("IGNORE_MARKET_HOURS", reason)
+
+        Config.IGNORE_MARKET_HOURS = False
+        Config.USE_SENTIMENT_GATE = False
+        allowed, reason = Config.live_entry_status()
+        self.assertFalse(allowed)
+        self.assertIn("data gates", reason)
 
 
 class DatabaseRegressionTests(unittest.TestCase):
@@ -748,6 +925,23 @@ class ReconciliationTests(unittest.TestCase):
 
 
 class WebApiSerializationTests(unittest.TestCase):
+    def test_manual_live_start_requires_non_persisted_acknowledgement(self):
+        webui = importlib.import_module("webui")
+        old_proc = webui.bot_proc
+        webui.bot_proc = None
+        try:
+            with mock.patch.object(webui, "_bot_lock_busy", return_value=False), \
+                 mock.patch.object(webui.subprocess, "Popen") as popen:
+                result = webui.start_bot(
+                    {"broker": "zerodha", "dry_run": False, "bankroll": "100000"},
+                    source="ui",
+                )
+            self.assertFalse(result["ok"])
+            self.assertIn("I_UNDERSTAND_LIVE_TRADING", result["error"])
+            popen.assert_not_called()
+        finally:
+            webui.bot_proc = old_proc
+
     def test_start_injects_only_selected_broker_credentials(self):
         webui = importlib.import_module("webui")
         old_proc = webui.bot_proc

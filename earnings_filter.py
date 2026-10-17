@@ -118,6 +118,23 @@ class EarningsFilter:
             return None
         return (next_date - _today_ist()).days
 
+    def has_fresh_data(self, symbol: str) -> bool:
+        """True only when a fresh calendar fetch produced a known next date.
+
+        ``is_blackout`` keeps its historical unknown=allow behavior for paper and
+        existing-position monitoring. Live entry selection uses this stricter
+        predicate so an outage or an unchecked symbol cannot pass as safe.
+        """
+        cached = self._cache.get(symbol)
+        if not cached:
+            return False
+        next_date, fetched_at, ok = cached
+        try:
+            return bool(ok and next_date is not None
+                        and 0 <= time.time() - float(fetched_at) < self._cache_ttl)
+        except (TypeError, ValueError, OverflowError):
+            return False
+
     # ── FETCH ─────────────────────────────────────────────────────────────────
     def _get_next_earnings(self, symbol: str) -> Optional[date]:
         """Returns next earnings date, from cache or Yahoo."""
@@ -171,7 +188,8 @@ class EarningsFilter:
 
     def get_blackout_set(self, symbols: list,
                          time_budget_secs: float = 90.0,
-                         max_consecutive_failures: int = 8) -> Set[str]:
+                         max_consecutive_failures: int = 8,
+                         fail_closed: bool = False) -> Set[str]:
         """Returns set of symbols currently in earnings blackout.
 
         ★ BOUNDED. This runs at the top of EVERY scan cycle over the whole
@@ -180,8 +198,9 @@ class EarningsFilter:
         can neither monitor open positions (stops dark!) nor respond to a stop
         request. Two brakes: a hard wall-clock budget, and a consecutive-failure
         circuit breaker (a systemic outage fails identically on every symbol —
-        after 8 in a row, checking the other 490 is pointless). Both fail OPEN
-        for the unchecked remainder, matching the gate's existing failure mode."""
+        after 8 in a row, checking the other 490 is pointless). Paper callers may
+        keep the historical fail-open behavior; live callers separately reject
+        every symbol without fresh calendar data."""
         blackout = set()
         start = time.time()
         consec_fail = 0
@@ -209,9 +228,10 @@ class EarningsFilter:
             except Exception:
                 failed += 1
         if stopped_early:
+            mode = "blocked for live entries" if fail_closed else "fail open for paper"
             log.warning(f"[Earnings] blackout pre-pass stopped early at {len(self._cache)}/{len(symbols)} "
-                        f"symbols; unchecked names fail open for this cycle")
+                        f"symbols; unchecked names {mode} this cycle")
         if failed:
-            log.warning(f"[Earnings] {failed} calendar fetches failed; gate inactive for those names "
+            log.warning(f"[Earnings] {failed} calendar fetches failed; live entries blocked for those names "
                         f"(retry in {self._fail_ttl//60}min)")
         return blackout

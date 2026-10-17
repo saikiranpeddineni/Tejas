@@ -52,6 +52,27 @@ NSE_HOLIDAYS = {
 }
 
 
+def quote_is_fresh(quote: Optional[Quote], max_age_mins: Optional[float] = None) -> bool:
+    """Return true only for a recent, exchange-timestamped quote."""
+    try:
+        stamp = quote.timestamp
+        if not isinstance(stamp, datetime):
+            return False
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        age_minutes = (
+            datetime.now(timezone.utc) - stamp.astimezone(timezone.utc)
+        ).total_seconds() / 60.0
+        if max_age_mins is None:
+            max_age_mins = getattr(Config, "MAX_QUOTE_STALENESS_MINS", 30.0)
+        max_age_mins = float(max_age_mins)
+        return math.isfinite(age_minutes) and math.isfinite(max_age_mins) and (
+            -5.0 <= age_minutes <= max_age_mins
+        )
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return False
+
+
 class BaseBroker:
     """Alpaca-compatible broker surface. Subclasses implement the low-level hooks."""
 
@@ -309,7 +330,7 @@ class BaseBroker:
             return None
         # Keep the identifier short enough for broker order-tag fields while
         # retaining enough entropy to correlate an ambiguous response.
-        client_order_id = f"tj_{uuid.uuid4().hex[:16]}"
+        client_order_id = self._new_client_order_id()
         try:
             res = self._place_entry(symbol, side.lower(), qty, client_order_id=client_order_id)
             if res:
@@ -319,6 +340,9 @@ class BaseBroker:
                     # correlated or reconciled; the caller can retry after
                     # checking the broker's order book.
                     log.error(f"[{self.name}] Order response for {symbol} had no broker order id")
+                    return None
+                if not self._validate_order_result(res, requested_qty=qty):
+                    log.error(f"[{self.name}] Order for {symbol} was not confirmed filled; refusing to book it")
                     return None
                 log.info(f"[{self.name}] Order: {side.upper()} {qty} {symbol} | id={str(res.get('id',''))[:12]} | cid={client_order_id}")
             return res
@@ -358,6 +382,9 @@ class BaseBroker:
                     not str(result.get("id", "")).strip()):
                 log.error(f"[{self.name}] Flatten response for {symbol} had no order id")
                 return None
+            if result and not self._validate_order_result(result):
+                log.error(f"[{self.name}] Flatten for {symbol} was not confirmed filled; keeping it open")
+                return None
             return result
         except Exception as e:
             log.error(f"[{self.name}] Close position failed {symbol}: {e}")
@@ -383,6 +410,9 @@ class BaseBroker:
             if float(result.get("qty", qty) or 0) > 0 and not str(result.get("id", "")).strip():
                 log.error(f"[{self.name}] Partial close response for {symbol} had no order id")
                 return None
+            if not self._validate_order_result(result, requested_qty=qty):
+                log.error(f"[{self.name}] Partial close for {symbol} was not confirmed filled")
+                return None
             return result
         except NotImplementedError:
             return None
@@ -392,6 +422,19 @@ class BaseBroker:
 
     def _sell_qty(self, symbol: str, qty: int) -> Optional[dict]:
         raise NotImplementedError
+
+    def _new_client_order_id(self) -> str:
+        """Return the stable client-order-id format used by live adapters."""
+        return f"tj_{uuid.uuid4().hex[:16]}"
+
+    def _validate_order_result(self, result: dict, requested_qty: Optional[int] = None) -> bool:
+        """Validate an order result at the broker boundary.
+
+        The simulated broker intentionally keeps the historical result shape and
+        therefore uses this permissive default.  LiveBrokerBase overrides it to
+        require a confirmed terminal fill with quantity and price.
+        """
+        return True
 
     # ════════════════════════════════════════════════════════════════════════
     # POSITIONS

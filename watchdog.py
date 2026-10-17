@@ -4,7 +4,7 @@ watchdog.py — keep the Tejas dashboard alive whenever the PC is on.
 A *one-shot* check, designed to be run every few minutes by Windows Task
 Scheduler (see setup_autostart.bat):
 
-  • If the dashboard (webui.py) is already answering on its port → do nothing.
+  • If the dashboard (webui.py) passes a bounded HTTP health read → do nothing.
   • Otherwise → launch it hidden (pythonw) and exit.
 
 The dashboard itself owns the market-hours logic: its supervisor thread starts
@@ -25,15 +25,21 @@ PORT = 8765  # must match HOST, PORT in webui.py
 # in the project (bad .env value, missing dependency in the pythonw interpreter)
 # would silently kill the entire keep-alive chain. The dashboard runs 24/7 (so
 # P&L stays viewable after close); only the BOT is market-hours-gated, and the
-# dashboard's supervisor owns that logic.
+# dashboard's supervisor owns that logic. A dead/hung HTTP server is relaunched;
+# live-entry acknowledgement and heartbeat checks remain owned by tejas.py.
 
 
 def _dashboard_up() -> bool:
+    """Return true only when the dashboard accepts a bounded HTTP health read."""
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(0.5)
+    s.settimeout(1.0)
     try:
         s.connect(("127.0.0.1", PORT))
-        return True
+        s.sendall(b"GET /api/status HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
+        response = s.recv(512)
+        status_line = response.split(b"\r\n", 1)[0]
+        # 401 is also a healthy dashboard when TEJAS_UI_TOKEN protects it.
+        return response.startswith(b"HTTP/") and (b" 200 " in status_line or b" 401 " in status_line)
     except OSError:
         return False
     finally:

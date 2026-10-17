@@ -36,6 +36,8 @@ _LIVE_BROKERS = frozenset({
     "zerodha", "upstox", "angelone", "angel", "smartapi", "dhan", "fyers",
 })
 
+_LIVE_ACK_TEXT = "I_UNDERSTAND_LIVE_TRADING"
+
 
 class Config:
     # ── Broker selection (Indian market — NSE equity) ──────────────────────────
@@ -43,8 +45,33 @@ class Config:
     BROKER  = os.getenv("BROKER", "simulated").lower()
     # Holding type: DELIVERY (multi-day, recommended) or INTRADAY (auto square-off)
     PRODUCT = os.getenv("PRODUCT", "DELIVERY").upper()
+
+    # ── Live-order acknowledgement ─────────────────────────────────────────────
+    # A live broker plus DRY_RUN=false is still monitor-only until both explicit
+    # opt-ins are present. Keeping this separate from DRY_RUN means existing live
+    # positions can still be monitored/flattened when the entry acknowledgement is
+    # missing, while a new entry can never be enabled by a stale dashboard setting.
+    LIVE_TRADING_ACK_TEXT = _LIVE_ACK_TEXT
+    LIVE_AUTOSTART_ACK_TEXT = "I_UNDERSTAND_LIVE_AUTOSTART"
+    ENABLE_LIVE_TRADING = os.getenv("ENABLE_LIVE_TRADING", "false").strip().lower() == "true"
+    LIVE_TRADING_ACK = os.getenv("LIVE_TRADING_ACK", "").strip()
+
+    # ── Runtime ────────────────────────────────────────────────────────────────
+    DRY_RUN               = os.getenv("DRY_RUN", "true").lower() == "true"
+    LIVE_MODE             = BROKER in _LIVE_BROKERS and not DRY_RUN
+    LIVE_FILTERS_ENABLED  = (
+        os.getenv("USE_EARNINGS_GATE", "true").lower() == "true"
+        and os.getenv("USE_SENTIMENT_GATE", "true").lower() == "true"
+        and os.getenv("USE_FUNDAMENTALS_GATE", "true").lower() == "true"
+    )
+    LIVE_ENTRIES_ENABLED  = (
+        LIVE_MODE
+        and ENABLE_LIVE_TRADING
+        and LIVE_TRADING_ACK == LIVE_TRADING_ACK_TEXT
+        and LIVE_FILTERS_ENABLED
+    )
     # PAPER = simulated/unknown fallback broker OR DRY_RUN on (no real orders)
-    PAPER_TRADING = (BROKER not in _LIVE_BROKERS) or os.getenv("DRY_RUN", "true").lower() == "true"
+    PAPER_TRADING = (BROKER not in _LIVE_BROKERS) or DRY_RUN
 
     # Index symbols used for regime/VIX/benchmark (logical names; data layer maps
     # them — e.g. Yahoo: NIFTY->^NSEI, INDIAVIX->^INDIAVIX)
@@ -70,8 +97,6 @@ class Config:
     TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    # ── Runtime ────────────────────────────────────────────────────────────────
-    DRY_RUN               = os.getenv("DRY_RUN", "true").lower() == "true"
     SCAN_INTERVAL_SECS    = int(os.getenv("SCAN_INTERVAL_SECONDS", "30"))   # ★ was 60
     MONITOR_INTERVAL_SECS = int(os.getenv("MONITOR_INTERVAL_SECONDS", "30"))
 
@@ -162,6 +187,9 @@ class Config:
     SENTIMENT_CACHE_MINS  = 30
     SENTIMENT_EDGE_BOOST  = 0.005
     SENTIMENT_EDGE_PENALTY= 0.010
+    SENTIMENT_SCAN_BUDGET_SECS = float(os.getenv("SENTIMENT_SCAN_BUDGET_SECONDS", "45"))
+    EARNINGS_SCAN_BUDGET_SECS = float(os.getenv("EARNINGS_SCAN_BUDGET_SECONDS", "30"))
+    FUNDAMENTALS_SCAN_BUDGET_SECS = float(os.getenv("FUNDAMENTALS_SCAN_BUDGET_SECONDS", "30"))
 
     # ── ★ Stop/Target (ATR-based) ─────────────────────────────────────────────
     # STOP_MAX 4% (was 6%): realized winners cluster at +0.5–2%, so a single 6%
@@ -235,6 +263,9 @@ class Config:
     # Data-feed health: halt new entries if the market-index quote is older than
     # this (targets hours/days-stale data; generous vs Yahoo's normal delay).
     MAX_QUOTE_STALENESS_MINS = float(os.getenv("MAX_QUOTE_STALENESS_MINS", "30"))
+    # A stalled process must not resume opening risk after its liveness marker has
+    # gone quiet. This is a local software-health check, not exchange protection.
+    MAX_HEARTBEAT_AGE_SECS = float(os.getenv("MAX_HEARTBEAT_AGE_SECONDS", "180"))
 
     # ── Portfolio Risk ────────────────────────────────────────────────────────
     MAX_DRAWDOWN_HALT  = float(os.getenv("MAX_DRAWDOWN_HALT", "0.10"))
@@ -286,6 +317,28 @@ class Config:
     #   mass exits/rotation). The scheduler retrains after-hours instead.
     RETRAIN_IN_SESSION  = os.getenv("RETRAIN_IN_SESSION", "false").lower() == "true"
     OVERFIT_AUC_DELTA   = 0.08
+
+    @classmethod
+    def live_entry_status(cls):
+        """Return ``(allowed, reason)`` for new orders in the current process.
+
+        Paper and dry-run configurations are allowed to use their existing
+        simulated/observation path. A real broker remains usable for monitoring
+        and exits when any live-entry prerequisite is absent.
+        """
+        if not (cls.BROKER in _LIVE_BROKERS and not cls.DRY_RUN):
+            return True, "paper or dry-run"
+        if not cls.ENABLE_LIVE_TRADING:
+            return False, "ENABLE_LIVE_TRADING is not true"
+        if cls.LIVE_TRADING_ACK != cls.LIVE_TRADING_ACK_TEXT:
+            return False, "LIVE_TRADING_ACK is missing or invalid"
+        if getattr(cls, "IGNORE_MARKET_HOURS", False):
+            return False, "IGNORE_MARKET_HOURS is unsafe for live entries"
+        if not all((getattr(cls, "USE_EARNINGS_GATE", False),
+                    getattr(cls, "USE_SENTIMENT_GATE", False),
+                    getattr(cls, "USE_FUNDAMENTALS_GATE", False))):
+            return False, "all live data gates must remain enabled"
+        return True, "enabled"
 
     # ── Trading Hours ─────────────────────────────────────────────────────────
     EOD_EXECUTION_ONLY        = True

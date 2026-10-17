@@ -8,6 +8,8 @@ Stdlib only (no extra dependency). Launch with the "Start Tejas" shortcut or
   • Live status (polled): equity + run P&L, equity sparkline, regime/VIX,
     open positions with live P&L, and a reasoning log.
   • "Top Picks" runs the analyst over the NSE universe and shows ranked stocks.
+  • Live starts require a one-time typed acknowledgement; persisted auto-start
+    settings remain paper/dry-run unless a separate environment opt-in is set.
 
 Default settings are paper-safe (simulated broker, fake money, no API key).
 """
@@ -32,6 +34,7 @@ import socket
 
 # NSE session calendar — single source of truth shared with the trading loop.
 from brokers.base import IST, SESSION_OPEN, SESSION_CLOSE, NSE_HOLIDAYS
+from config import Config
 
 import logging
 log = logging.getLogger("webui")
@@ -78,6 +81,7 @@ def lan_url() -> str:
 _proc_lock = threading.Lock()
 bot_proc: subprocess.Popen | None = None
 bot_cfg: dict = {}
+bot_started_at = 0.0
 
 _CYCLE_RE = re.compile(r"Cycle (\d+) \| ₹([\d,]+\.\d+) dd=([\d.]+)% open=(\d+) regime=(\w+)")
 _VIX_RE   = re.compile(r"VIX≈([\d.]+)")
@@ -157,12 +161,44 @@ def save_autostart_opts(opts: dict) -> None:
         pass
 
 
+HEARTBEAT_PATH = os.path.join(BASE_DIR, "tejas.heartbeat")
+
+
+def _owned_bot_heartbeat_stale() -> bool:
+    """Bounded liveness check for a bot child launched by this dashboard.
+
+    A stale marker is only actionable after the child has had one full health
+    interval to start. External ``python tejas.py`` processes remain untouched;
+    the trading loop still applies its own entry gate and offline-gap audit.
+    """
+    if not bot_started_at or bot_proc is None or bot_proc.poll() is not None:
+        return False
+    try:
+        max_age = max(1.0, float(Config.MAX_HEARTBEAT_AGE_SECS))
+    except (TypeError, ValueError):
+        max_age = 180.0
+    now = time.time()
+    if now - bot_started_at <= max_age:
+        return False
+    try:
+        with open(HEARTBEAT_PATH, encoding="utf-8") as f:
+            stamp = datetime.fromisoformat(f.read().strip())
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=IST)
+        age = now - stamp.timestamp()
+        return age > max_age
+    except (OSError, ValueError, TypeError, OverflowError):
+        return True
+
+
 def _auto_supervisor() -> None:
     """Background: keep the bot running through NSE market windows and stopped
     outside them — unless the user manually paused it via the Stop button.
     The DASHBOARD itself stays up 24/7 (it's a tiny idle server and holds no
     keep-awake) so P&L and trade history are viewable after the close; only the
-    BOT is lifecycle-managed."""
+    BOT is lifecycle-managed. A stale heartbeat on a dashboard-owned child is
+    recycled after a bounded interval so a hung loop does not remain unnoticed.
+    """
     import logging
     log = logging.getLogger("supervisor")
     while True:
@@ -176,6 +212,9 @@ def _auto_supervisor() -> None:
                         log.info("[Auto] Market window open — bot started (pid=%s)", res.get("pid"))
                     else:
                         log.warning("[Auto] Could not auto-start bot: %s", res.get("error"))
+                elif in_win and running and _owned_bot_heartbeat_stale():
+                    log.error("[Auto] Bot heartbeat is stale — requesting bounded restart")
+                    stop_bot(source="auto")
                 elif (not in_win) and running:
                     stop_bot(source="auto")
                     log.info("[Auto] Outside market window — bot stopped")
@@ -270,7 +309,7 @@ def save_keys(values: dict, broker: str | None = None) -> None:
 
 # ── bot process control ──────────────────────────────────────────────────────
 def start_bot(opts: dict, source: str = "ui") -> dict:
-    global bot_proc, bot_cfg
+    global bot_proc, bot_cfg, bot_started_at
     if not isinstance(opts, dict):
         return {"ok": False, "error": "start options must be a JSON object"}
 
@@ -286,12 +325,35 @@ def start_bot(opts: dict, source: str = "ui") -> dict:
         return {"ok": False, "error": f"unsupported broker: {broker}"}
     dry_run = _flag(opts.get("dry_run"))
     ignore_hours = _flag(opts.get("ignore_hours"))
-    # Auto-start is never allowed to arm live orders from persisted UI state.
-    # Apply that downgrade before credential validation so a saved live-broker
-    # selection can still run safely in dry-run mode when credentials are absent.
-    if (source == "auto" and broker != "simulated" and not dry_run
-            and not _flag(opts.get("auto_live"))):
+    requested_live = broker != "simulated" and not dry_run
+
+    # A dashboard acknowledgement is one-shot and is deliberately never saved in
+    # autostart.local.json. Persisted live-broker settings therefore cannot arm
+    # orders by themselves.
+    if source == "ui" and requested_live:
+        if str(opts.get("live_ack", "")).strip() != Config.LIVE_TRADING_ACK_TEXT:
+            return {"ok": False,
+                    "error": "Live orders require typing "
+                             f"{Config.LIVE_TRADING_ACK_TEXT} in the acknowledgement prompt."}
+        if ignore_hours:
+            return {"ok": False,
+                    "error": "Disable Test mode · ignore hours before enabling live orders."}
+
+    # Auto-start is paper/dry-run by default. It can only run live when a separate
+    # environment acknowledgement is present; the persisted dashboard selection is
+    # not sufficient. This guard is intentionally independent of the UI ack.
+    auto_live = (
+        source == "auto" and requested_live
+        and not ignore_hours
+        and _flag(os.environ.get("ENABLE_LIVE_AUTOSTART"))
+        and os.environ.get("LIVE_AUTOSTART_ACK", "").strip()
+            == Config.LIVE_AUTOSTART_ACK_TEXT
+    )
+    if source == "auto" and not auto_live and broker != "simulated":
+        broker = "simulated"
         dry_run = True
+        ignore_hours = False
+        requested_live = False
 
     with _proc_lock:
         if bot_proc and bot_proc.poll() is None:
@@ -314,6 +376,14 @@ def start_bot(opts: dict, source: str = "ui") -> dict:
         env["BROKER"]                = broker
         env["DRY_RUN"]               = "true" if dry_run else "false"
         env["IGNORE_MARKET_HOURS"]   = "true" if ignore_hours else "false"
+        # Never inherit a live acknowledgement into a paper or auto-start child.
+        # The child receives the live guard only for this explicitly approved run.
+        if requested_live and (source == "ui" or auto_live):
+            env["ENABLE_LIVE_TRADING"] = "true"
+            env["LIVE_TRADING_ACK"] = Config.LIVE_TRADING_ACK_TEXT
+        else:
+            env["ENABLE_LIVE_TRADING"] = "false"
+            env["LIVE_TRADING_ACK"] = ""
         # ★ VALIDATE numerics before injecting: the child parses these with
         #   float()/int() at import time with stderr discarded, so one bad value
         #   from the (unauthenticated, LAN-reachable) API or a corrupt
@@ -353,12 +423,14 @@ def start_bot(opts: dict, source: str = "ui") -> dict:
                 )
             finally:
                 startup_log.close()
+            bot_started_at = time.time()
         except OSError:
             log.error("[Start] Could not launch Tejas child", exc_info=True)
             bot_proc = None
             return {"ok": False, "error": "could not launch Tejas"}
         bot_cfg = {k: env[k] for k in
-                   ("BROKER", "DRY_RUN", "IGNORE_MARKET_HOURS", "BANKROLL")}
+                   ("BROKER", "DRY_RUN", "IGNORE_MARKET_HOURS", "BANKROLL",
+                    "ENABLE_LIVE_TRADING")}
         if source == "ui":
             # Remember these for the auto-supervisor, and clear any manual pause.
             save_autostart_opts(opts)
@@ -576,7 +648,6 @@ def status() -> dict:
     feed = [l for l in log if any(t in l for t in
             ("[Analyst]", "[Decision]", "[Risk]", "ENTRY", "EXIT", "⤫",
              "[Regime]", "Scan:", "DRAWDOWN"))][-32:]
-    from config import Config
     return {
         "running": is_running(), "config": bot_cfg,
         "equity": equity, "start": start, "run_pnl": run_pnl, "run_pct": run_pct,
@@ -925,7 +996,7 @@ PAGE = r"""<!doctype html><html lang="en" data-theme="light"><head><meta charset
 </header>
 <main>
  <div class="panel controls">
-  <div class="fld" title="simulated = paper (fake money, real NSE data, no API key). Others place REAL orders and need that broker's API key.">
+  <div class="fld" title="simulated = paper (fake money, real NSE data, no API key). A real broker remains monitor-only until the live acknowledgement and all safety gates pass.">
    <label>Broker</label>
    <select id="broker">
     <option value="simulated">Paper (simulated)</option>
@@ -935,7 +1006,7 @@ PAGE = r"""<!doctype html><html lang="en" data-theme="light"><head><meta charset
   <div class="fld" title="Starting capital in ₹. Fake money in paper mode."><label>Capital ₹</label>
    <input id="bankroll" type="number" value="100000" style="width:120px"></div>
   <button class="ghost" onclick="openKeys()" style="align-self:end"
-    title="Enter & save this broker's API credentials (needed only for live trading; stored locally on this machine).">🔑 API Keys</button>
+    title="Enter & save this broker's API credentials (needed only for live trading; stored locally on this machine). Credentials alone do not arm live entries.">🔑 API Keys</button>
   <button class="ghost" onclick="train()" style="align-self:end"
     title="Train the forward-return forecast model on historical NSE data (a few minutes). (Re)start the bot afterward to use it.">🧠 Train</button>
   <label class="toggle" title="ON = log-only: prints the trades it WOULD make but fills nothing, so equity stays flat. OFF = paper-trade with simulated fills (P&L moves).">
@@ -1048,8 +1119,17 @@ function setTheme(t){document.documentElement.dataset.theme=t;localStorage.setIt
 $('themeBtn').onclick=()=>setTheme(document.documentElement.dataset.theme==='dark'?'light':'dark');
 setTheme(localStorage.getItem('tejas-theme')||'light');
 // actions
-async function start(){const r=await(await fetch('/api/start',{method:'POST',headers:POST_HEADERS,body:JSON.stringify(
- {broker:broker.value,bankroll:bankroll.value,dry_run:dry.checked,ignore_hours:ign.checked})})).json();
+async function start(){
+ let live_ack='';
+ const wantsLive=broker.value!=='simulated'&&!dry.checked;
+ if(wantsLive){
+  live_ack=prompt('Live orders are real. Type I_UNDERSTAND_LIVE_TRADING to continue:')||'';
+  if(live_ack.trim()!=='I_UNDERSTAND_LIVE_TRADING'){
+   alert('Live start cancelled — the acknowledgement did not match.');return;
+  }
+ }
+ const r=await(await fetch('/api/start',{method:'POST',headers:POST_HEADERS,body:JSON.stringify(
+  {broker:broker.value,bankroll:bankroll.value,dry_run:dry.checked,ignore_hours:ign.checked,live_ack})})).json();
  if(r&&r.ok===false)alert('⚠ '+(r.error||'could not start'));setTimeout(poll,400);}
 async function resetData(){if(!confirm('Clear all recorded paper trades from the local database?'))return;
  const r=await(await fetch('/api/reset',{method:'POST',headers:POST_HEADERS})).json();
@@ -1085,7 +1165,8 @@ async function poll(){let s;try{s=await(await fetch('/api/status')).json();}catc
  $('startBtn').disabled=s.running;$('stopBtn').disabled=!s.running;
  const c=s.config||{};const mp=$('modepill');
  if(c.BROKER){mp.style.display='';const live=c.DRY_RUN!=='true'&&c.BROKER!=='simulated';
-   mp.textContent=c.DRY_RUN==='true'?'DRY-RUN':(c.BROKER==='simulated'?'PAPER':'LIVE');
+   const armed=live&&c.ENABLE_LIVE_TRADING==='true';
+   mp.textContent=c.DRY_RUN==='true'?'DRY-RUN':(c.BROKER==='simulated'?'PAPER':(armed?'LIVE':'LIVE · MONITOR-ONLY'));
    mp.className='mode'+(live?' live':'');$('cfg').textContent=BNAME[c.BROKER]||c.BROKER;}else{mp.style.display='none';$('cfg').textContent='';}
  // Mirror the ACTUAL running config onto every device (laptop ⇄ phone in sync),
  // and lock the controls while running so they reflect reality, not local edits.

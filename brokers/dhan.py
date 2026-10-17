@@ -74,15 +74,26 @@ class DhanBroker(LiveBrokerBase):
         }
         if client_order_id:
             payload["correlationId"] = client_order_id
-        data = self._post(f"{BASE}/orders", json=payload)
-        return {"id": data.get("orderId", ""), "symbol": symbol, "qty": qty}
+        body = self._post(f"{BASE}/orders", json=payload)
+        order_id = body.get("orderId", "") if isinstance(body, dict) else ""
+        return self._confirm_order(order_id, symbol, side, int(qty), client_order_id)
+
+    def _order_status(self, order_id: str, client_order_id: str = "") -> dict:
+        """Dhan's order-by-id endpoint returns the latest fill fields."""
+        record = self._get(f"{BASE}/orders/{order_id}")
+        if not isinstance(record, dict):
+            record = {}
+        return self._normalize_order_status(
+            record,
+            status=record.get("orderStatus"),
+            order_id=order_id,
+            client_order_id=client_order_id,
+            filled_qty=record.get("filledQty"),
+            filled_avg_price=record.get("averageTradedPrice"),
+        )
 
     def _flatten(self, symbol) -> Optional[dict]:
-        pos = self._get_position_strict(symbol)
-        qty = int(float(pos.get("qty", 0) or 0)) if pos else 0
-        if qty == 0:
-            return {"symbol": symbol, "qty": 0}
-        return self._place_entry(symbol, "sell" if qty > 0 else "buy", abs(qty))
+        return self._flatten_position(symbol)
 
     def _positions(self) -> List[dict]:
         data = self._get(f"{BASE}/positions") or []

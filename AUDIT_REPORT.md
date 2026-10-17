@@ -6,17 +6,18 @@
 
 ## Result
 
-The audit traced the critical flows from configuration and market-data ingestion through feature construction, signal filtering, Kelly sizing, portfolio risk gates, broker submission, fills, ledger persistence, staged exits, restart restoration, reconciliation, dashboard control, and shutdown. Verified issues were fixed with focused changes rather than a framework rewrite.
+The audit traced the critical flows from configuration and market-data ingestion through feature construction, signal filtering, Kelly sizing, portfolio risk gates, broker submission, fills, ledger persistence, staged exits, restart restoration, reconciliation, dashboard control, and shutdown. Verified issues were fixed with focused changes rather than a framework rewrite. A second hardening pass added bounded live-order status confirmation and explicit live-entry safety gates.
 
 ### Trading, risk, and execution
 
 - Broker adapters now share client-order IDs, reject malformed/error envelopes, avoid automatic POST retries, require broker order IDs, and fail closed on account/position/quote failures.
+- Live adapters now poll their read-only order-status endpoints after submission and expose a fill only after a terminal filled/traded state contains a valid whole-share quantity and average price. Rejected, cancelled, expired, unknown, timed-out, mismatched, or partial flatten responses remain unsafe and cannot be booked as a completed local trade.
 - Live flattening no longer treats a failed position lookup as an already-flat account.
-- Orders and staged exits use whole-share quantities and broker-reported fills where available; malformed fill data cannot create a local position. `DRY_RUN=true` is now observation-only and cannot create hypothetical ledger trades or P&L.
+- Orders and staged exits use whole-share quantities and broker-reported fills where available; malformed or fractional position data cannot create a local position. `DRY_RUN=true` is now observation-only and cannot create hypothetical ledger trades or P&L.
 - Risk sizing no longer inflates a capped order back to the minimum. Kelly sizing uses each signal's actual stop/target distances, preserves defensive regime multipliers, and rejects invalid probability/risk inputs.
 - Exposure, sector, beta, drawdown, daily-loss, cooldown, and extreme-regime gates are restart-aware and fail closed on non-finite portfolio state.
 - Open-trade restoration preserves trailing highs, staged-exit state, feature defaults, sector exposure, and malformed-row safety. Simulated-broker restoration also carries realized paper P&L across restarts.
-- Exit monitoring validates prices, avoids stale/off-hours exits, wires the cached earnings pre-event exit, persists trailing highs, and keeps trades open when flattening fails.
+- Exit monitoring validates prices, rejects stale exchange timestamps, avoids off-hours exits, wires the cached earnings pre-event exit, persists trailing highs, and keeps trades open when flattening fails.
 - Reconciliation aggregates duplicate symbols, tolerates whole-share rounding, distinguishes broker outages from a confirmed flat account, rejects malformed quantities, and suppresses repeated identical alerts.
 
 ### Data, ML, and analytics
@@ -32,6 +33,8 @@ The audit traced the critical flows from configuration and market-data ingestion
 - The dashboard binds to loopback by default. Deliberate remote binding requires a configured token and HTTP Basic authentication; mutating requests require a custom header and bounded JSON bodies.
 - Dashboard output and Telegram messages escape external/model text. Credential files are allowlisted, atomically written with restrictive permissions, and only the selected broker's credentials are passed to its child process. Telegram errors do not log bot-token URLs.
 - Dashboard polling tails only a bounded log window, startup diagnostics are capped, and scheduler/reconciliation shutdown is interruptible. Forecast-model status checks the forecast artifact, and unattended live-broker selections are downgraded to dry-run before credential validation.
+- Live entries require `DRY_RUN=false`, an explicit live acknowledgement, enabled earnings/sentiment/fundamental gates, normal market-hours mode, fresh feed data, and a healthy heartbeat. Missing or stale live-entry data blocks new risk while restored positions remain monitorable and exitable. Dashboard manual starts require a one-shot typed acknowledgement; persisted auto-start settings cannot arm live orders by themselves.
+- The watchdog now performs a bounded HTTP health read, and dashboard-owned bot children are recycled after a stale heartbeat. Heartbeat writes are atomic and durable enough to avoid treating a torn marker as healthy.
 - The old unbounded log handler is now rotating. Runtime state, local credentials, databases, logs, and generated model outputs are ignored for new commits.
 - Reproducibility files were added: `.python-version`, pinned `requirements.lock`, `Dockerfile`, `.dockerignore`, `.env.example`, `Makefile`, and setup/run/test/deploy/recovery documentation in `README.md`.
 
@@ -39,7 +42,7 @@ The audit traced the critical flows from configuration and market-data ingestion
 
 Commands run from the repository root:
 
-- `make test` — passed; 27 deterministic offline regression tests.
+- `make test` — passed; 35 deterministic offline regression tests.
 - `python -m unittest discover -s tests -p 'test*.py' -v` — passed.
 - `.venv/bin/python -m unittest discover -s tests -p 'test*.py' -v` — passed.
 - `python -m compileall -q .` — passed.
@@ -47,12 +50,11 @@ Commands run from the repository root:
 - `.venv/bin/python -m pip check` — passed for the packages installed in that environment.
 - `git diff --check` — passed for source/test/documentation changes; a pre-existing generated model backup contains trailing whitespace.
 
-The Docker executable is not available in this environment, so an actual image build/run could not be performed here. The Dockerfile uses Python 3.11.9 and installs the pinned lockfile plus `libgomp1` required by the ML stack.
+The Docker executable is not available in this environment, so an actual image build/run could not be performed here. The Dockerfile uses Python 3.11.9 and installs the pinned lockfile plus `libgomp1` required by the ML stack. No broker sandbox or live credential test was run here.
 
 ## Remaining risks requiring deliberate operational or broker-specific work
 
-1. **Asynchronous live fills:** the live adapters return submitted order IDs, but they do not yet poll each broker's order/trade endpoint for final fill status. Before live use, validate partial fills, rejections, and delayed fills in each broker's sandbox and add adapter-specific reconciliation/polling.
-2. **Software-only stops:** NSE delivery stops are enforced by the running process, not an exchange-side bracket. A host/process/feed outage can leave positions unprotected; keep the watchdog/supervisor active and treat offline-gap alerts as incidents.
-3. **External feed outages:** earnings, sentiment, fundamentals, and Yahoo market data have bounded retries/budgets but some gates intentionally fail open to avoid freezing all trading. Operators should disable new entries if those feeds remain degraded.
-4. **Legacy artifacts/state:** existing local databases, logs, and model artifacts may contain historical schema/model versions. Legacy or untagged model metrics are intentionally untrusted until a fresh compatible training run writes model-specific metadata.
-5. **Remote dashboard transport:** remote mode is authenticated but plain HTTP. Use loopback by default or put deliberate LAN access behind a trusted network and TLS/reverse proxy.
+1. **Broker-specific validation:** the adapter status paths are bounded and fail closed, but each broker's live/sandbox response schema, numeric status codes, partial-fill behavior, rate limits, and session-expiry behavior still require a broker-account smoke test before capital is used. A network failure after an accepted POST must be reconciled against the broker order book; the code deliberately does not retry an ambiguous POST.
+2. **Software-only stops:** NSE delivery stops are enforced by the running process, not an exchange-side bracket. A host/process/feed outage can leave positions unprotected; keep the watchdog/supervisor active and treat offline-gap alerts as incidents. These safeguards do not create exchange-side protection.
+3. **Legacy artifacts/state:** existing local databases, logs, and model artifacts may contain historical schema/model versions. Legacy or untagged model metrics are intentionally untrusted until a fresh compatible training run writes model-specific metadata.
+4. **Remote dashboard transport:** remote mode is authenticated but plain HTTP. Use loopback by default or put deliberate LAN access behind a trusted network and TLS/reverse proxy.

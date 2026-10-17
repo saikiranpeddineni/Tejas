@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from analyst_engine import AnalystEngine
-from brokers.base import BaseBroker
+from brokers.base import BaseBroker, quote_is_fresh
 from config import Config
 from earnings_filter import EarningsFilter
 from feature_builder_gold import FeatureBuilderGold
@@ -88,6 +88,9 @@ class ExitEngine:
             quote_mid = 0.0
         if quote_mid <= 0:
             log.debug(f"[Exit] {trade.symbol}: no quote — skipping this check")
+            return None
+        if not quote_is_fresh(quote):
+            log.warning(f"[Exit] {trade.symbol}: stale quote — skipping this check")
             return None
         current_price = quote_mid
         try:

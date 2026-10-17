@@ -86,15 +86,30 @@ class AngelOneBroker(LiveBrokerBase):
         }
         if client_order_id:
             payload["ordertag"] = client_order_id
-        data = self._post(f"{BASE}/rest/secure/angelbroking/order/v1/placeOrder", json=payload).get("data", {})
-        return {"id": data.get("orderid", ""), "symbol": symbol, "qty": qty}
+        body = self._post(f"{BASE}/rest/secure/angelbroking/order/v1/placeOrder", json=payload)
+        data = body.get("data", {}) if isinstance(body, dict) else {}
+        order_id = data.get("orderid", "") if isinstance(data, dict) else ""
+        return self._confirm_order(order_id, symbol, side, int(qty), client_order_id)
+
+    def _order_status(self, order_id: str, client_order_id: str = "") -> dict:
+        """SmartAPI order-detail endpoint returns one order's current state."""
+        record = self._get(
+            f"{BASE}/rest/secure/angelbroking/order/v1/details/{order_id}"
+        )
+        record = record.get("data", {}) if isinstance(record, dict) else {}
+        if not isinstance(record, dict):
+            record = {}
+        return self._normalize_order_status(
+            record,
+            status=(record.get("orderstatus") or record.get("orderStatus")) if record else None,
+            order_id=order_id,
+            client_order_id=client_order_id,
+            filled_qty=(record.get("filledshares") or record.get("filledquantity")) if record else None,
+            filled_avg_price=(record.get("averageprice") or record.get("avgprice")) if record else None,
+        )
 
     def _flatten(self, symbol) -> Optional[dict]:
-        pos = self._get_position_strict(symbol)
-        qty = int(float(pos.get("qty", 0) or 0)) if pos else 0
-        if qty == 0:
-            return {"symbol": symbol, "qty": 0}
-        return self._place_entry(symbol, "sell" if qty > 0 else "buy", abs(qty))
+        return self._flatten_position(symbol)
 
     def _positions(self) -> List[dict]:
         data = self._get(f"{BASE}/rest/secure/angelbroking/order/v1/getPosition").get("data") or []

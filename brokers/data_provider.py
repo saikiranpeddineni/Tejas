@@ -132,7 +132,7 @@ def search_news(query: str, count: int = 8) -> List[dict]:
             "https://query1.finance.yahoo.com/v1/finance/search",
             params={"q": query, "newsCount": count, "quotesCount": 0,
                     "enableFuzzyQuery": "false"},
-            timeout=10,
+            timeout=5,
         )
         r.raise_for_status()
         return r.json().get("news", []) or []

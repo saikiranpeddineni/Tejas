@@ -3,7 +3,8 @@ tejas.py — Tejas Live Trading Entry Point
 ==============================================
 THE MAIN RUNNER. Start with:
     python tejas.py               # paper trading (DRY_RUN=true in .env)
-    DRY_RUN=false python tejas.py # live trading
+    # Live entries also require ENABLE_LIVE_TRADING=true and
+    # LIVE_TRADING_ACK=I_UNDERSTAND_LIVE_TRADING; otherwise monitor-only.
 
 Architecture (NSE equity; market data from Yahoo, orders via an Indian broker):
   RegimeEngine      → India-VIX/trend-based market regime detection
@@ -42,6 +43,7 @@ import db
 import edge_engine
 import telegram_alerts
 from brokers import get_broker
+from brokers.base import quote_is_fresh
 from config import Config
 from dynamic_risk import DynamicRiskManager
 from earnings_filter import EarningsFilter
@@ -433,6 +435,15 @@ def _attempt_entry(signal, portfolio, regime, ml, exec_e, risk_mgr):
     Returns (trade_or_None, reason) where reason ∈
         {"entered", "gate", "size", "risk", "failed", "dry_run"}.
     """
+    # Final in-process guard: every path that can reach broker entry (normal scan
+    # and rotation) must independently prove that live orders were explicitly
+    # enabled. This still leaves the exit/monitor path untouched.
+    if Config.LIVE_MODE:
+        allowed, reason = Config.live_entry_status()
+        if not allowed:
+            log.warning(f"[Main] ⤫ {signal.symbol}: live entry guard blocked — {reason}")
+            return None, "gate"
+
     ok, reason, entry_quality, kelly_pct, raw_size = _prevalidate_entry(
         signal, portfolio, regime, ml
     )
@@ -481,21 +492,31 @@ def _hours_held(entry_time: datetime, now: datetime) -> float:
 
 
 def _feed_stale(broker) -> bool:
-    """True if the price feed looks stale (don't open new positions on it).
+    """True if required market data is unavailable or stale for new entries.
 
-    Checks the market-index quote's *exchange* timestamp. A missing quote or one
-    older than MAX_QUOTE_STALENESS_MINS means our data source is degraded — during
-    which the safe action is to halt new entries rather than trade on old prices.
-    (Threshold is generous to tolerate Yahoo's normal delay; it targets hours/days-
-    stale data, not a 15-minute lag.)"""
-    if getattr(Config, "IGNORE_MARKET_HOURS", False):
+    Existing positions are monitored before this gate. In paper mode the legacy
+    ``IGNORE_MARKET_HOURS`` test override remains available; a live broker never
+    bypasses the exchange-timestamp check and also needs a valid market bar set for
+    the regime calculation.
+    """
+    live_mode = not getattr(Config, "PAPER_TRADING", True)
+    if getattr(Config, "IGNORE_MARKET_HOURS", False) and not live_mode:
         return False
     try:
         q = broker.get_quote(Config.MARKET_INDEX_SYMBOL, force=True)
-        if q is None:
+        if q is None or not quote_is_fresh(q):
             return True
-        age_min = (datetime.now(timezone.utc) - q.timestamp).total_seconds() / 60.0
-        return age_min > getattr(Config, "MAX_QUOTE_STALENESS_MINS", 30)
+        if live_mode:
+            bars = broker.get_bars(Config.MARKET_INDEX_SYMBOL, "1Day", limit=2)
+            if not bars:
+                return True
+            latest = bars[-1]
+            close = float(getattr(latest, "close", 0.0))
+            if not math.isfinite(close) or close <= 0:
+                return True
+        return False
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return True
     except Exception:
         return True
 
@@ -649,12 +670,39 @@ def _keep_system_awake(enable: bool) -> None:
         pass
 
 
-def _write_heartbeat() -> None:
+def _write_heartbeat() -> bool:
+    tmp_path = f"{HEARTBEAT_PATH}.tmp.{os.getpid()}"
     try:
-        with open(HEARTBEAT_PATH, "w", encoding="utf-8") as f:
+        with open(tmp_path, "w", encoding="utf-8") as f:
             f.write(datetime.now(timezone.utc).isoformat())
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, HEARTBEAT_PATH)
+        return True
     except OSError:
-        pass
+        log.error("[Main] Heartbeat write failed — live entries remain blocked")
+        return False
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def _heartbeat_age_seconds():
+    """Return the age of the previous heartbeat; infinity means unusable."""
+    try:
+        with open(HEARTBEAT_PATH, encoding="utf-8") as f:
+            stamp = datetime.fromisoformat(f.read().strip())
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - stamp.astimezone(timezone.utc)).total_seconds()
+        if age < -5.0:
+            return float("inf")
+        return max(0.0, age)
+    except (OSError, ValueError, TypeError, OverflowError):
+        return float("inf")
 
 
 def _offline_gap_minutes() -> float:
@@ -713,8 +761,19 @@ def main() -> None:
     _signal_mod.signal(_signal_mod.SIGINT,  _signal_handler)
     _signal_mod.signal(_signal_mod.SIGTERM, _signal_handler)
 
-    mode = "📋 PAPER" if Config.PAPER_TRADING else "🔴 LIVE"
-    dry  = " [DRY RUN — no real orders]" if Config.DRY_RUN else " [ORDERS ACTIVE]"
+    live_entries_allowed, live_entry_reason = Config.live_entry_status()
+    if Config.PAPER_TRADING:
+        mode = "📋 PAPER"
+    elif live_entries_allowed:
+        mode = "🔴 LIVE"
+    else:
+        mode = "🔴 LIVE / MONITOR-ONLY"
+    if Config.DRY_RUN:
+        dry = " [DRY RUN — no real orders]"
+    elif Config.LIVE_MODE and not live_entries_allowed:
+        dry = " [NEW LIVE ENTRIES DISABLED — monitoring/exits only]"
+    else:
+        dry = " [ORDERS ACTIVE]"
 
     if not _acquire_single_instance():
         log.error("[Main] Another Tejas instance is already running — exiting "
@@ -726,6 +785,12 @@ def main() -> None:
     log.info(f" DB:      {Config.DB_PATH}")
     log.info(f" Capital: ₹{Config.BANKROLL:,.2f}")
     log.info(f" MinEdge: {Config.MIN_EDGE:.1%}  MaxDD: {Config.MAX_DRAWDOWN_HALT:.0%}  MaxPos: {Config.MAX_OPEN_POSITIONS}")
+    if not Config.PAPER_TRADING:
+        if live_entries_allowed:
+            log.info("[Main] Live-entry acknowledgement and required data gates are enabled")
+        else:
+            log.warning(f"[Main] 🛑 New live entries disabled — {live_entry_reason}; "
+                        "existing positions remain monitored/exitable")
     try:
         from universe import get_universe
         _u, _ = get_universe()
@@ -751,11 +816,12 @@ def main() -> None:
     # ── Portfolio state ────────────────────────────────────────────────────
     live_pv = broker.get_portfolio_value()
     if not Config.PAPER_TRADING and live_pv <= 0:
-        # A LIVE broker that can't return account equity almost always means auth
-        # is broken. Refuse to start rather than trade against a guessed bankroll.
+        # Keep the process alive so restored live positions can still be monitored
+        # and exited. The first loop's account_ok gate blocks new entries until a
+        # real account value is available; Config.BANKROLL is sizing-only fallback
+        # and is never treated as live equity while the account is unhealthy.
         log.error("[Main] 🛑 LIVE broker returned no account value (auth/account "
-                  "failure) — refusing to start. Fix broker credentials first.")
-        sys.exit(1)
+                  "failure) — monitoring only; new entries blocked until it recovers.")
     start_pv = live_pv if live_pv > 0 else Config.BANKROLL
     log.info(f"[Main] Portfolio value: ₹{start_pv:,.2f}")
 
@@ -770,7 +836,17 @@ def main() -> None:
     # >10 in-session minutes = a real outage (normal supervisor restarts land
     # well under that), and only worth shouting about if positions were exposed.
     gap_mins = _offline_gap_minutes()
-    _write_heartbeat()   # fresh baseline now, so a crash loop can't re-alert
+    previous_heartbeat_age = _heartbeat_age_seconds()
+    startup_monitor_only = bool(
+        Config.LIVE_MODE and portfolio.open_trades and (
+            gap_mins > 10
+            or previous_heartbeat_age > getattr(Config, "MAX_HEARTBEAT_AGE_SECS", 180)
+        )
+    )
+    heartbeat_ok = _write_heartbeat()   # fresh baseline now, so a crash loop can't re-alert
+    if Config.LIVE_MODE and not heartbeat_ok:
+        live_entries_allowed = False
+        live_entry_reason = "heartbeat file is not writable"
     if gap_mins > 10 and portfolio.open_trades:
         log.warning(
             f"[Main] ⚠️ OFFLINE {gap_mins:.0f} in-session min — "
@@ -813,7 +889,15 @@ def main() -> None:
         try:
             cycle += 1
             cycle_start = time.monotonic()
-            _write_heartbeat()   # liveness marker for the offline-gap audit
+            previous_heartbeat_age = _heartbeat_age_seconds()
+            heartbeat_ok = _write_heartbeat()   # liveness marker for the offline-gap audit
+            heartbeat_healthy = bool(
+                heartbeat_ok
+                and previous_heartbeat_age <= getattr(Config, "MAX_HEARTBEAT_AGE_SECS", 180)
+            )
+            if Config.LIVE_MODE and not heartbeat_healthy:
+                log.warning("[Main] 🛑 Heartbeat age/write health failed — "
+                            "monitoring only; no new live entries this cycle")
 
             # ── Refresh live portfolio value ───────────────────────────────
             # ★ Not in DRY_RUN: the broker book never sees dry-run fills, so its
@@ -935,12 +1019,23 @@ def main() -> None:
                 _sleep(Config.SCAN_INTERVAL_SECS)
                 continue
 
-            # ── ★ Halt new entries on account/data-feed failure ────────────
+            # ── ★ Halt new entries on account/data/process health failure ───
             #   (open positions were already monitored above; this only blocks
-            #   OPENING new risk on a broken account or stale prices.)
-            if not account_ok or _feed_stale(broker):
-                if account_ok:
-                    log.warning("[Main] 🛑 Price feed stale — monitoring only, no new entries")
+            #   OPENING new risk on a broken account, stale feed, or stalled loop.)
+            entry_block_reason = None
+            if Config.LIVE_MODE and not live_entries_allowed:
+                entry_block_reason = live_entry_reason
+            elif Config.LIVE_MODE and startup_monitor_only:
+                entry_block_reason = "first cycle after an offline monitoring gap"
+            elif Config.LIVE_MODE and not heartbeat_healthy:
+                entry_block_reason = "heartbeat health is outside its bound"
+            elif not account_ok:
+                entry_block_reason = "live account value unavailable"
+            elif _feed_stale(broker):
+                entry_block_reason = "market feed unavailable or stale"
+            if entry_block_reason:
+                log.warning(f"[Main] 🛑 New entries blocked — {entry_block_reason}; "
+                            "monitoring only")
                 signals = []
             else:
                 signals = sig_engine.scan(regime=regime)
@@ -983,6 +1078,11 @@ def main() -> None:
                     rot_cands, portfolio, regime, sig_engine,
                     ml, exec_e, exit_e, risk_mgr, broker,
                 )
+
+            # The first post-restart monitor pass has now run. Do not keep the
+            # startup-only entry brake armed after the exposed positions were
+            # checked once.
+            startup_monitor_only = False
 
             # ── Per-cycle decision summary (always logged) ─────────────────
             log.info(

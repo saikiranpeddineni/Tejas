@@ -74,15 +74,34 @@ class UpstoxBroker(LiveBrokerBase):
         }
         if client_order_id:
             payload["tag"] = client_order_id
-        data = self._post(f"{BASE}/order/place", json=payload).get("data", {})
-        return {"id": data.get("order_id", ""), "symbol": symbol, "qty": qty}
+        body = self._post(f"{BASE}/order/place", json=payload)
+        data = body.get("data", {}) if isinstance(body, dict) else {}
+        order_id = data.get("order_id", "") if isinstance(data, dict) else ""
+        return self._confirm_order(order_id, symbol, side, int(qty), client_order_id)
+
+    def _order_status(self, order_id: str, client_order_id: str = "") -> dict:
+        """Upstox order details returns the latest state for this order id."""
+        body = self._get(f"{BASE}/order/details", params={"order_id": order_id})
+        record = body.get("data", {}) if isinstance(body, dict) else {}
+        if isinstance(record, list):
+            matches = [
+                item for item in record
+                if isinstance(item, dict)
+                and str(item.get("order_id", item.get("orderId", ""))) == str(order_id)
+            ]
+            record = matches[-1] if matches else {}
+        if not isinstance(record, dict):
+            record = {}
+        return self._normalize_order_status(
+            record,
+            order_id=order_id,
+            client_order_id=client_order_id,
+            filled_qty=record.get("filled_quantity"),
+            filled_avg_price=record.get("average_price"),
+        )
 
     def _flatten(self, symbol) -> Optional[dict]:
-        pos = self._get_position_strict(symbol)
-        qty = int(float(pos.get("qty", 0) or 0)) if pos else 0
-        if qty == 0:
-            return {"symbol": symbol, "qty": 0}
-        return self._place_entry(symbol, "sell" if qty > 0 else "buy", abs(qty))
+        return self._flatten_position(symbol)
 
     def _positions(self) -> List[dict]:
         data = self._get(f"{BASE}/portfolio/short-term-positions").get("data", [])
