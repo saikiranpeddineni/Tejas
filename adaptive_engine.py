@@ -117,7 +117,18 @@ class AdaptiveFeedbackEngine:
                         ent = ent.replace(tzinfo=timezone.utc)
                     
                     pnl_pct = float(r["pnl_pct"])
-                    sec_code = int(r["sector_code"] or 6)
+                    # =============================================================================
+                    # [MODIFIED 2026-11-01]: Fix sector_code 0 falsy defaulting to 6
+                    # ORIGINAL INTENT: Default NULL sector code to 6 ("other").
+                    # REASON FOR CHANGE: In Python, `0 or 6` evaluates to 6, misclassifying
+                    # sector 0 ("technology") as 6 ("other") on DB restore.
+                    # -----------------------------------------------------------------------------
+                    # [PREVIOUS CODE - PRESERVED]:
+                    # sec_code = int(r["sector_code"] or 6)
+                    # -----------------------------------------------------------------------------
+                    # [NEW CODE]:
+                    sec_code = int(r["sector_code"]) if r["sector_code"] is not None else 6
+                    # =============================================================================
                     sector = _SECTOR_NAMES.get(sec_code, "other")
                     sym = r["symbol"]
 
