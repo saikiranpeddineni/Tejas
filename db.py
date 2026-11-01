@@ -125,6 +125,35 @@ CREATE TABLE IF NOT EXISTS portfolio_snapshots (
     total_pnl   REAL    DEFAULT 0,
     recorded_at TEXT    DEFAULT (datetime('now','utc'))
 );
+
+-- =============================================================================
+-- [MODIFIED 2026-11-01]: Add trade_postmortems table for Self-Healing Engine
+-- ORIGINAL INTENT: _SCHEMA ended after portfolio_snapshots table definition.
+-- REASON FOR CHANGE: Self-healing engine requires persistent forensic ledger
+-- for trade outcomes, root-cause attribution, and cluster loss analysis.
+-- -----------------------------------------------------------------------------
+-- [NEW CODE]:
+CREATE TABLE IF NOT EXISTS trade_postmortems (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id            TEXT    NOT NULL UNIQUE,
+    symbol              TEXT    NOT NULL,
+    sector_code         INTEGER DEFAULT 6,
+    entry_price         REAL    NOT NULL,
+    exit_price          REAL    NOT NULL,
+    pnl_pct             REAL    NOT NULL,
+    pnl_usd             REAL    NOT NULL,
+    exit_reason         TEXT,
+    entry_time          TEXT    NOT NULL,
+    exit_time           TEXT    NOT NULL,
+    failure_category    TEXT    NOT NULL,
+    diagnostics_json    TEXT    DEFAULT '{}',
+    feature_vector_json TEXT    DEFAULT '{}',
+    created_at          TEXT    DEFAULT (datetime('now','utc'))
+);
+CREATE INDEX IF NOT EXISTS idx_pm_symbol ON trade_postmortems (symbol);
+CREATE INDEX IF NOT EXISTS idx_pm_exit   ON trade_postmortems (exit_time DESC);
+CREATE INDEX IF NOT EXISTS idx_pm_cat    ON trade_postmortems (failure_category);
+-- =============================================================================
 """
 
 

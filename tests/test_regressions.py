@@ -711,10 +711,28 @@ class DatabaseRegressionTests(unittest.TestCase):
             conn.close()
             self.db._local.conn = None
 
+    # =============================================================================
+    # [MODIFIED 2026-11-01]: Safe Windows tempdir cleanup in DatabaseRegressionTests
+    # ORIGINAL INTENT: Called self.tempdir.cleanup() directly.
+    # REASON FOR CHANGE: On Windows, background worker SQLite handles can transiently
+    # hold file locks during unlink. Wrap in try/except to prevent WinError 32.
+    # SAFE ROLLBACK: Preserved original cleanup below as comments.
+    # -----------------------------------------------------------------------------
+    # [PREVIOUS CODE - PRESERVED]:
+    # def _cleanup(self):
+    #     self._close_thread_connection()
+    #     Config.DB_PATH = self._old_path
+    #     self.tempdir.cleanup()
+    # -----------------------------------------------------------------------------
+    # [NEW CODE]:
     def _cleanup(self):
         self._close_thread_connection()
         Config.DB_PATH = self._old_path
-        self.tempdir.cleanup()
+        try:
+            self.tempdir.cleanup()
+        except Exception:
+            pass
+    # =============================================================================
 
     def test_schema_migrations_and_failed_write_rollback_leave_connection_usable(self):
         columns = {
@@ -802,6 +820,11 @@ class DatabaseRegressionTests(unittest.TestCase):
                 first_done.set()
             except Exception as exc:  # surfaced by the assertions below
                 errors.append(exc)
+            finally:
+                conn = getattr(self.db._local, "conn", None)
+                if conn is not None:
+                    conn.close()
+                    self.db._local.conn = None
 
         first = threading.Thread(target=writer, args=("A", False))
         second = threading.Thread(target=writer, args=("B", True))

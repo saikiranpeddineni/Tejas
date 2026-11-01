@@ -47,6 +47,7 @@ from brokers.base import quote_is_fresh
 from config import Config
 from dynamic_risk import DynamicRiskManager
 from earnings_filter import EarningsFilter
+from adaptive_engine import AdaptiveFeedbackEngine
 from execution_engine import ExecutionEngine
 from exit_engine import ExitEngine
 from feature_builder_gold import FeatureBuilderGold
@@ -802,16 +803,36 @@ def main() -> None:
     # ── Init DB ────────────────────────────────────────────────────────────
     db.init_db()
 
-    # ── Init all components ────────────────────────────────────────────────
+    # =============================================================================
+    # [MODIFIED 2026-11-01]: Initialize AdaptiveFeedbackEngine (Self-Healing)
+    # ORIGINAL INTENT: Initialized components without adaptive feedback engine.
+    # REASON FOR CHANGE: Self-healing bot requires AdaptiveFeedbackEngine connected
+    # to risk management, execution postmortems, and signal candidate penalties.
+    # SAFE ROLLBACK: Preserved original component wiring below as comments.
+    # -----------------------------------------------------------------------------
+    # [PREVIOUS CODE - PRESERVED]:
+    # broker    = get_broker()
+    # ml        = MLEngineGold()
+    # builder   = FeatureBuilderGold(broker)
+    # earnings  = EarningsFilter()
+    # sentiment = SentimentEngine()
+    # regime_e  = RegimeEngine(broker)
+    # risk_mgr  = DynamicRiskManager(broker)
+    # exec_e    = ExecutionEngine(broker, ml)
+    # exit_e    = ExitEngine(broker, ml, builder, earnings=earnings)
+    # -----------------------------------------------------------------------------
+    # [NEW CODE]:
     broker    = get_broker()
     ml        = MLEngineGold()
     builder   = FeatureBuilderGold(broker)
     earnings  = EarningsFilter()
     sentiment = SentimentEngine()
     regime_e  = RegimeEngine(broker)
-    risk_mgr  = DynamicRiskManager(broker)
-    exec_e    = ExecutionEngine(broker, ml)
+    adaptive  = AdaptiveFeedbackEngine(broker=broker, ml=ml)
+    risk_mgr  = DynamicRiskManager(broker, adaptive=adaptive)
+    exec_e    = ExecutionEngine(broker, ml, adaptive=adaptive)
     exit_e    = ExitEngine(broker, ml, builder, earnings=earnings)
+    # =============================================================================
 
     # ── Portfolio state ────────────────────────────────────────────────────
     live_pv = broker.get_portfolio_value()
@@ -856,8 +877,18 @@ def main() -> None:
         telegram_alerts.alert_offline_gap(gap_mins, [t.symbol for t in portfolio.open_trades])
     _keep_system_awake(True)   # PC must not sleep while stops are software-only
 
-    # ── Signal engine ──────────────────────────────────────────────────────
-    sig_engine = SignalEngineGold(broker, ml, builder, earnings, sentiment)
+    # =============================================================================
+    # [MODIFIED 2026-11-01]: Pass adaptive engine to SignalEngineGold
+    # ORIGINAL INTENT: sig_engine = SignalEngineGold(broker, ml, builder, earnings, sentiment)
+    # REASON FOR CHANGE: Enable candidate penalty against toxic failure subspaces.
+    # SAFE ROLLBACK: Preserved original instantiation below.
+    # -----------------------------------------------------------------------------
+    # [PREVIOUS CODE - PRESERVED]:
+    # sig_engine = SignalEngineGold(broker, ml, builder, earnings, sentiment)
+    # -----------------------------------------------------------------------------
+    # [NEW CODE]:
+    sig_engine = SignalEngineGold(broker, ml, builder, earnings, sentiment, adaptive=adaptive)
+    # =============================================================================
 
     # ── Scheduler (background jobs) ────────────────────────────────────────
     scheduler = build_scheduler(ml, portfolio, telegram_alerts, broker)

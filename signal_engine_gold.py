@@ -29,6 +29,29 @@ log = logging.getLogger(__name__)
 
 
 class SignalEngineGold:
+    # =============================================================================
+    # [MODIFIED 2026-11-01]: Add adaptive feedback engine to SignalEngineGold
+    # ORIGINAL INTENT: SignalEngineGold received broker, ml, builder, earnings, sentiment.
+    # REASON FOR CHANGE: Enable candidate penalty evaluation against recent failure clusters.
+    # SAFE ROLLBACK: The original code is preserved below as comments.
+    # -----------------------------------------------------------------------------
+    # [PREVIOUS CODE - PRESERVED]:
+    # def __init__(
+    #     self,
+    #     broker: BaseBroker,
+    #     ml: MLEngineGold,
+    #     builder: FeatureBuilderGold,
+    #     earnings: EarningsFilter,
+    #     sentiment: SentimentEngine,
+    # ):
+    #     self.broker    = broker
+    #     self.ml        = ml
+    #     self.builder   = builder
+    #     self.earnings  = earnings
+    #     self.sentiment = sentiment
+    #     self.analyst   = AnalystEngine()
+    # -----------------------------------------------------------------------------
+    # [NEW CODE]:
     def __init__(
         self,
         broker: BaseBroker,
@@ -36,13 +59,16 @@ class SignalEngineGold:
         builder: FeatureBuilderGold,
         earnings: EarningsFilter,
         sentiment: SentimentEngine,
+        adaptive=None,
     ):
         self.broker    = broker
         self.ml        = ml
         self.builder   = builder
         self.earnings  = earnings
         self.sentiment = sentiment
+        self.adaptive  = adaptive
         self.analyst   = AnalystEngine()
+    # =============================================================================
         from fundamentals_engine import FundamentalsEngine
         self.fundamentals = FundamentalsEngine()
         # ★ composite score of EVERY symbol evaluated in the last scan (incl. names
@@ -264,6 +290,26 @@ class SignalEngineGold:
         ml_conf = conf
         base_edge = prob - 0.50
 
+        # =============================================================================
+        # [MODIFIED 2026-11-01]: Adaptive feature-subspace penalty integration
+        # ORIGINAL INTENT: Edge adjusted only for regime boost and sentiment boost.
+        # REASON FOR CHANGE: Self-healing bot evaluates candidate features against
+        # historically failing subspaces and applies an adaptive penalty if matched.
+        # SAFE ROLLBACK: Preserved original calculation below as comments.
+        # -----------------------------------------------------------------------------
+        # [PREVIOUS CODE - PRESERVED]:
+        # # ★ Regime edge threshold adjustment
+        # regime_edge_adjustment = regime.get("edge_boost", 0.0)
+        # effective_min_edge = Config.MIN_EDGE + regime_edge_adjustment
+        # 
+        # # ★ Sentiment edge boost
+        # sentiment_adj = self.sentiment.edge_adjustment(symbol)
+        # adjusted_edge = base_edge + sentiment_adj
+        # 
+        # if adjusted_edge < effective_min_edge:
+        #     return None
+        # -----------------------------------------------------------------------------
+        # [NEW CODE]:
         # ★ Regime edge threshold adjustment
         regime_edge_adjustment = regime.get("edge_boost", 0.0)
         effective_min_edge = Config.MIN_EDGE + regime_edge_adjustment
@@ -272,8 +318,21 @@ class SignalEngineGold:
         sentiment_adj = self.sentiment.edge_adjustment(symbol)
         adjusted_edge = base_edge + sentiment_adj
 
+        # ★ Adaptive failure-cluster penalty (Self-Healing)
+        adaptive_penalty = 0.0
+        adaptive_reason = ""
+        if getattr(self, "adaptive", None) is not None:
+            adaptive_penalty, adaptive_reason = self.adaptive.evaluate_candidate_penalty(
+                symbol, features, regime
+            )
+            if adaptive_penalty > 0:
+                adjusted_edge -= adaptive_penalty
+                view["composite"] = max(-1.0, view["composite"] - adaptive_penalty)
+                log.info(f"[Adaptive] {symbol}: penalized -{adaptive_penalty:.3f} edge ({adaptive_reason})")
+
         if adjusted_edge < effective_min_edge:
             return None
+        # =============================================================================
 
         # ATR-based stop/target (dynamic)
         atr = features.atr_pct * current_price

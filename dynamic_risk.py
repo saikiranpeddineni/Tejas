@@ -42,11 +42,28 @@ _APPROX_BETA = {
 
 
 class DynamicRiskManager:
-    def __init__(self, broker: BaseBroker):
+    # =============================================================================
+    # [MODIFIED 2026-11-01]: Add adaptive feedback engine to DynamicRiskManager
+    # ORIGINAL INTENT: DynamicRiskManager received only broker instance.
+    # REASON FOR CHANGE: Enable dynamic severity-scaled cooldowns, sector cluster
+    # throttling, and loss velocity circuit breakers.
+    # SAFE ROLLBACK: The original code is preserved below as comments.
+    # -----------------------------------------------------------------------------
+    # [PREVIOUS CODE - PRESERVED]:
+    # def __init__(self, broker: BaseBroker):
+    #     self.broker = broker
+    #     self._daily_pnl = 0.0         # track P&L within the trading day
+    #     self._daily_pnl_date = None   # date of last reset
+    #     self._recent_exits: Dict[str, datetime] = {}   # symbol -> last exit time (re-entry cooldown)
+    # -----------------------------------------------------------------------------
+    # [NEW CODE]:
+    def __init__(self, broker: BaseBroker, adaptive=None):
         self.broker = broker
+        self.adaptive = adaptive
         self._daily_pnl = 0.0         # track P&L within the trading day
         self._daily_pnl_date = None   # date of last reset
         self._recent_exits: Dict[str, datetime] = {}   # symbol -> last exit time (re-entry cooldown)
+    # =============================================================================
 
     # ── ★ RESTART-PROOF STATE ────────────────────────────────────────────────
     def restore_state_from_db(self) -> None:
@@ -162,17 +179,66 @@ class DynamicRiskManager:
         if signal.symbol in {t.symbol for t in portfolio.open_trades}:
             return None
 
-        # ── 5b. ★ RE-ENTRY COOLDOWN ───────────────────────────────
-        # Don't immediately re-buy a name we just exited (prevents sell→rebuy churn).
-        last_exit = self._recent_exits.get(signal.symbol)
-        if last_exit is not None:
-            hrs = (datetime.now(timezone.utc) - last_exit).total_seconds() / 3600.0
-            if hrs < Config.REENTRY_COOLDOWN_HOURS:
-                log.info(f"[Risk] {signal.symbol} in re-entry cooldown ({hrs:.1f}h < {Config.REENTRY_COOLDOWN_HOURS:.0f}h)")
+        # =============================================================================
+        # [MODIFIED 2026-11-01]: Adaptive severity-scaled cooldown & cluster breaker
+        # ORIGINAL INTENT: Used fixed REENTRY_COOLDOWN_HOURS and static sector limits.
+        # REASON FOR CHANGE: If adaptive engine is available, scale cooldown by loss severity
+        # and enforce sector cluster throttling + macro loss velocity breakers.
+        # SAFE ROLLBACK: Preserved previous logic below.
+        # -----------------------------------------------------------------------------
+        # [PREVIOUS CODE - PRESERVED]:
+        # # ── 5b. ★ RE-ENTRY COOLDOWN ───────────────────────────────
+        # # Don't immediately re-buy a name we just exited (prevents sell→rebuy churn).
+        # last_exit = self._recent_exits.get(signal.symbol)
+        # if last_exit is not None:
+        #     hrs = (datetime.now(timezone.utc) - last_exit).total_seconds() / 3600.0
+        #     if hrs < Config.REENTRY_COOLDOWN_HOURS:
+        #         log.info(f"[Risk] {signal.symbol} in re-entry cooldown ({hrs:.1f}h < {Config.REENTRY_COOLDOWN_HOURS:.0f}h)")
+        #         return None
+        # 
+        # # ── 6. SECTOR LIMIT ───────────────────────────────────────
+        # sector = _SECTOR_NAMES.get(signal.features.sector_code, "other")
+        # limit  = Config.SECTOR_LIMITS.get(sector, 0.20)
+        # curr   = portfolio.sector_exposure.get(sector, 0.0)
+        # if (curr + raw_size) / bankroll > limit:
+        #     avail = limit * bankroll - curr
+        #     if avail < Config.MIN_POSITION_USD:
+        #         log.warning(f"[Risk] Sector {sector} at limit")
+        #         return None
+        #     raw_size = avail
+        # -----------------------------------------------------------------------------
+        # [NEW CODE]:
+        # ── 5b. ★ ADAPTIVE RE-ENTRY COOLDOWN ─────────────────────
+        if getattr(self, "adaptive", None) is not None:
+            in_cd, hrs_left = self.adaptive.is_symbol_in_cooldown(signal.symbol)
+            if in_cd:
+                log.info(f"[Risk] {signal.symbol} in adaptive loss cooldown ({hrs_left:.1f}h remaining)")
                 return None
+        else:
+            last_exit = self._recent_exits.get(signal.symbol)
+            if last_exit is not None:
+                hrs = (datetime.now(timezone.utc) - last_exit).total_seconds() / 3600.0
+                if hrs < Config.REENTRY_COOLDOWN_HOURS:
+                    log.info(f"[Risk] {signal.symbol} in re-entry cooldown ({hrs:.1f}h < {Config.REENTRY_COOLDOWN_HOURS:.0f}h)")
+                    return None
 
-        # ── 6. SECTOR LIMIT ───────────────────────────────────────
+        # ── 5c. ★ MACRO LOSS VELOCITY BREAKER ────────────────────
+        if getattr(self, "adaptive", None) is not None:
+            cluster_mult = self.adaptive.get_cluster_risk_multiplier()
+            if cluster_mult <= 0.0:
+                log.warning(f"[Risk] Macro loss velocity breaker active — rejecting {signal.symbol}")
+                return None
+            raw_size *= cluster_mult
+
+        # ── 6. SECTOR LIMIT & SECTOR CLUSTER THROTTLE ────────────
         sector = _SECTOR_NAMES.get(signal.features.sector_code, "other")
+        if getattr(self, "adaptive", None) is not None:
+            is_throttled, sec_reason, sec_mult = self.adaptive.is_sector_throttled(sector)
+            if is_throttled:
+                log.warning(f"[Risk] {sec_reason} — rejecting {signal.symbol}")
+                return None
+            raw_size *= sec_mult
+
         limit  = Config.SECTOR_LIMITS.get(sector, 0.20)
         curr   = portfolio.sector_exposure.get(sector, 0.0)
         if (curr + raw_size) / bankroll > limit:
@@ -181,6 +247,7 @@ class DynamicRiskManager:
                 log.warning(f"[Risk] Sector {sector} at limit")
                 return None
             raw_size = avail
+        # =============================================================================
 
         # ── 7. TOTAL EXPOSURE CAP & ELITE RESERVE ─────────────────
         # Normal cap is 70%. The last 15% (up to 85%) is reserved ONLY for

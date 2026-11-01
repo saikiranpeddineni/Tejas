@@ -21,11 +21,28 @@ log = logging.getLogger(__name__)
 
 
 class ExecutionEngine:
-    def __init__(self, broker: BaseBroker, ml: MLEngineGold):
+    # =============================================================================
+    # [MODIFIED 2026-11-01]: Add adaptive feedback engine to ExecutionEngine
+    # ORIGINAL INTENT: ExecutionEngine received broker and ml instances.
+    # REASON FOR CHANGE: Post-trade feedback loop requires adaptive engine to record
+    # trade postmortems immediately upon position close.
+    # SAFE ROLLBACK: The original code is preserved below as comments.
+    # -----------------------------------------------------------------------------
+    # [PREVIOUS CODE - PRESERVED]:
+    # def __init__(self, broker: BaseBroker, ml: MLEngineGold):
+    #     self.broker = broker
+    #     self.ml     = ml
+    #     self.slip   = SlippageEngine()
+    #     self.last_was_dry_run = False
+    # -----------------------------------------------------------------------------
+    # [NEW CODE]:
+    def __init__(self, broker: BaseBroker, ml: MLEngineGold, adaptive=None):
         self.broker = broker
         self.ml     = ml
+        self.adaptive = adaptive
         self.slip   = SlippageEngine()
         self.last_was_dry_run = False
+    # ==============================================================================
 
     def execute(
         self,
@@ -350,6 +367,21 @@ class ExecutionEngine:
             # position in the live portfolio merely because optional ML logging
             # failed.
             log.warning(f"[Exec] ML exit logging failed for {trade.symbol}: {e}")
+
+        # =============================================================================
+        # [MODIFIED 2026-11-01]: Record forensic post-mortem in Adaptive Engine
+        # ORIGINAL INTENT: Only ML exit logging was performed on close.
+        # REASON FOR CHANGE: Self-healing bot requires immediate loss attribution and
+        # cluster telemetry for sector and symbol risk adaptation.
+        # SAFE ROLLBACK: Guarded by try/except; failure does not impact trade close.
+        # -----------------------------------------------------------------------------
+        # [NEW CODE]:
+        if getattr(self, "adaptive", None) is not None:
+            try:
+                self.adaptive.record_postmortem(trade, exit_price, pnl_pct, exit_reason)
+            except Exception as e:
+                log.warning(f"[Exec] Adaptive postmortem logging failed for {trade.symbol}: {e}")
+        # =============================================================================
 
         emoji = "✅" if pnl_usd >= 0 else "❌"
         log.info(
