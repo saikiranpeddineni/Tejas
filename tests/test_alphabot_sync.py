@@ -152,6 +152,39 @@ class AlphaBotSyncTests(unittest.TestCase):
         # Modals
         self.assertIn("btModal", page)
         self.assertIn("setModal", page)
+        self.assertIn("keysModal", page)
+        self.assertIn("qrModal", page)
+        self.assertIn("flattenModal", page)
+        self.assertIn("liveModal", page)
+
+        # Essential Working Handlers
+        required_handlers = [
+            "openQR", "openKeysModal", "saveKeys", "fetchBrokerFields",
+            "changeMode", "handleStartStop", "openSettingsModal", "saveSettings",
+            "drawChart", "drawBacktestChart", "triggerScanner", "quickAdd",
+            "removeSymbol", "openFlattenModal", "confirmFlattenAll", "resetCooldowns"
+        ]
+        for h in required_handlers:
+            self.assertIn(h, page, f"Expected handler {h} to be defined in webui.PAGE")
+
+    def test_safe_numeric_positions_and_trades(self):
+        """Verify that trade_history and open_positions guarantee non-None numbers."""
+        hist = webui.trade_history()
+        self.assertIsInstance(hist, list)
+        for t in hist:
+            self.assertIsInstance(t["entry_price"], (int, float))
+            self.assertIsInstance(t["exit_price"], (int, float))
+            self.assertIsInstance(t["pnl_usd"], (int, float))
+            self.assertIsInstance(t["pnl_pct"], (int, float))
+            self.assertIn("attribution", t)
+
+        pos = webui.open_positions()
+        self.assertIsInstance(pos, list)
+        for p in pos:
+            self.assertIsInstance(p["entry_price"], (int, float))
+            self.assertIsInstance(p["current_price"], (int, float))
+            self.assertIsInstance(p["pnl_usd"], (int, float))
+            self.assertIsInstance(p["pnl_pct"], (int, float))
 
     def test_trading_brain_integrity(self):
         """Confirm that core ML, risk, and self-healing trading logic are untouched."""
