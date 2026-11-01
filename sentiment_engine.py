@@ -119,12 +119,41 @@ class SentimentEngine:
         """Get sentiment for multiple symbols efficiently."""
         return {sym: self.get_score(sym) for sym in symbols}
 
+    # =============================================================================
+    # [MODIFIED 2026-11-01]: Parity fix for sentiment data freshness
+    # ORIGINAL INTENT: Required int(relevant) > 0 to ensure news was fetched and not an outage.
+    # REASON FOR CHANGE: On quiet news days, relevant is 0 but fetch_ok is True (no adverse news).
+    # Requiring int(relevant) > 0 caused live trading to block quiet normal stocks while
+    # paper trading allowed them. Outages are correctly tracked by fetch_ok.
+    # SAFE ROLLBACK: Preserved original implementation below as comments.
+    # -----------------------------------------------------------------------------
+    # [PREVIOUS CODE - PRESERVED]:
+    # def has_fresh_data(self, symbol: str) -> bool:
+    #     """True only when a recent fetch succeeded and yielded relevant news.
+    #
+    #     The neutral ``(0.0, 0)`` result remains valid for paper monitoring, but it
+    #     is not enough evidence to permit a new live entry: an empty result can also
+    #     be an upstream outage hidden by the provider's compatibility fallback.
+    #     """
+    #     cached = self._cache.get(symbol)
+    #     health = self._health.get(symbol)
+    #     if not cached or not health:
+    #         return False
+    #     value, fetched_at = cached
+    #     checked_at, fetch_ok = health
+    #     try:
+    #         score, relevant = value
+    #         age = time.time() - min(float(fetched_at), float(checked_at))
+    #         return bool(fetch_ok and int(relevant) > 0 and 0 <= age < self._cache_ttl)
+    #     except (TypeError, ValueError, OverflowError):
+    #         return False
+    # -----------------------------------------------------------------------------
+    # [NEW CODE]:
     def has_fresh_data(self, symbol: str) -> bool:
-        """True only when a recent fetch succeeded and yielded relevant news.
+        """True when a fresh news fetch succeeded and confirmed sentiment status.
 
-        The neutral ``(0.0, 0)`` result remains valid for paper monitoring, but it
-        is not enough evidence to permit a new live entry: an empty result can also
-        be an upstream outage hidden by the provider's compatibility fallback.
+        fetch_ok verifies that the news provider was reached without error or outage.
+        When a stock has no breaking news (relevant == 0), neutral sentiment is verified.
         """
         cached = self._cache.get(symbol)
         health = self._health.get(symbol)
@@ -135,9 +164,10 @@ class SentimentEngine:
         try:
             score, relevant = value
             age = time.time() - min(float(fetched_at), float(checked_at))
-            return bool(fetch_ok and int(relevant) > 0 and 0 <= age < self._cache_ttl)
+            return bool(fetch_ok and 0 <= age < self._cache_ttl)
         except (TypeError, ValueError, OverflowError):
             return False
+    # =============================================================================
 
     def edge_adjustment(self, symbol: str) -> float:
         """

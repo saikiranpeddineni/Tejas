@@ -46,3 +46,4 @@ Thumbs.db
 # Generated/retrained model artifacts
 models/lgb_gold.txt
 models/*.pkl
+.opencode/

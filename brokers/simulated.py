@@ -191,24 +191,74 @@ class SimulatedBroker(BaseBroker):
             })
         return out
 
-    # ── order hooks (only used when DRY_RUN=false) ────────────────────────────
+    # =============================================================================
+    # [MODIFIED 2026-11-01]: Realistic bid/ask spread execution in SimulatedBroker
+    # ORIGINAL INTENT: _place_entry used pure mid/last price without bid/ask spread friction.
+    # REASON FOR CHANGE: Paper trading must exactly simulate live execution: buy at Ask,
+    # sell at Bid, and return standard live broker confirmation fields (status="filled").
+    # SAFE ROLLBACK: Preserved original implementation below as comments.
+    # -----------------------------------------------------------------------------
+    # [PREVIOUS CODE - PRESERVED]:
+    # def _place_entry(self, symbol, side, qty, client_order_id="") -> Optional[dict]:
+    #     px = self._last_price(symbol)
+    #     if px <= 0:
+    #         log.warning(f"[simulated] no price for {symbol} — order rejected")
+    #         return None
+    #     if side == "buy":
+    #         cost = qty * px
+    #         if cost > self.cash:
+    #             qty = int(self.cash // px)
+    #             if qty < 1:
+    #                 log.warning(f"[simulated] insufficient cash for {symbol}")
+    #                 return None
+    #             cost = qty * px
+    #         self.cash -= cost
+    #         pos = self.book.get(symbol, {"qty": 0, "avg": 0.0})
+    #         new_qty = pos["qty"] + qty
+    #         pos["avg"] = (pos["avg"] * pos["qty"] + px * qty) / new_qty
+    #         pos["qty"] = new_qty
+    #         self.book[symbol] = pos
+    #     else:  # sell to reduce/close
+    #         pos = self.book.get(symbol)
+    #         if not pos:
+    #             return None
+    #         qty = min(qty, pos["qty"])
+    #         self.cash += qty * px
+    #         pos["qty"] -= qty
+    #         if pos["qty"] <= 0:
+    #             self.book.pop(symbol, None)
+    #     oid = client_order_id if client_order_id else f"sim_{int(time.time()*1000)}"
+    #     log.info(f"[simulated] FILL {side.upper()} {qty} {symbol} @ ₹{px:.2f} "
+    #              f"| cash=₹{self.cash:,.0f}")
+    #     return {"id": oid, "symbol": symbol, "qty": qty, "filled_avg_price": px}
+    # -----------------------------------------------------------------------------
+    # [NEW CODE]:
     def _place_entry(self, symbol, side, qty, client_order_id="") -> Optional[dict]:
         px = self._last_price(symbol)
         if px <= 0:
             log.warning(f"[simulated] no price for {symbol} — order rejected")
             return None
+
+        # Exact market execution simulation: buy at Ask, sell at Bid
+        q = self.get_quote(symbol, force=True)
+        if q and q.ask > 0 and q.bid > 0 and q.ask >= q.bid:
+            fill_px = q.ask if side == "buy" else q.bid
+        else:
+            spread_half = getattr(Config, "FEE_PCT", 0.0011) / 2.0
+            fill_px = px * (1.0 + spread_half) if side == "buy" else px * (1.0 - spread_half)
+
         if side == "buy":
-            cost = qty * px
+            cost = qty * fill_px
             if cost > self.cash:
-                qty = int(self.cash // px)
+                qty = int(self.cash // fill_px)
                 if qty < 1:
                     log.warning(f"[simulated] insufficient cash for {symbol}")
                     return None
-                cost = qty * px
+                cost = qty * fill_px
             self.cash -= cost
             pos = self.book.get(symbol, {"qty": 0, "avg": 0.0})
             new_qty = pos["qty"] + qty
-            pos["avg"] = (pos["avg"] * pos["qty"] + px * qty) / new_qty
+            pos["avg"] = (pos["avg"] * pos["qty"] + fill_px * qty) / new_qty
             pos["qty"] = new_qty
             self.book[symbol] = pos
         else:  # sell to reduce/close
@@ -216,14 +266,26 @@ class SimulatedBroker(BaseBroker):
             if not pos:
                 return None
             qty = min(qty, pos["qty"])
-            self.cash += qty * px
+            self.cash += qty * fill_px
             pos["qty"] -= qty
             if pos["qty"] <= 0:
                 self.book.pop(symbol, None)
+
         oid = client_order_id if client_order_id else f"sim_{int(time.time()*1000)}"
-        log.info(f"[simulated] FILL {side.upper()} {qty} {symbol} @ ₹{px:.2f} "
-                 f"| cash=₹{self.cash:,.0f}")
-        return {"id": oid, "symbol": symbol, "qty": qty, "filled_avg_price": px}
+        log.info(
+            f"[simulated] FILL {side.upper()} {qty} {symbol} @ ₹{fill_px:.2f} "
+            f"(mid=₹{px:.2f}) | cash=₹{self.cash:,.0f}"
+        )
+        return {
+            "id": oid,
+            "symbol": symbol,
+            "qty": qty,
+            "filled_avg_price": fill_px,
+            "status": "filled",
+            "filled_qty": qty,
+            "requested_qty": qty,
+        }
+    # =============================================================================
 
     def _flatten(self, symbol) -> Optional[dict]:
         pos = self.book.get(symbol)

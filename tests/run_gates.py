@@ -25,6 +25,9 @@ def run_suite(target: str, token: str):
     elif target == "regressions":
         import tests.test_regressions as m
         suite = loader.loadTestsFromModule(m)
+    elif target == "parity":
+        import tests.test_paper_live_parity as m
+        suite = loader.loadTestsFromModule(m)
     elif target == "discover":
         suite = loader.discover("tests")
     else:

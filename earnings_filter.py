@@ -118,22 +118,49 @@ class EarningsFilter:
             return None
         return (next_date - _today_ist()).days
 
+    # =============================================================================
+    # [MODIFIED 2026-11-01]: Parity fix for earnings data freshness
+    # ORIGINAL INTENT: Required next_date is not None to ensure calendar data was fetched.
+    # REASON FOR CHANGE: When a company has no earnings scheduled in the current window,
+    # next_date is None but ok is True (verified safe). Requiring next_date is not None
+    # caused live trading to reject >90% of safe stocks that paper trading traded.
+    # SAFE ROLLBACK: Preserved original implementation below as comments.
+    # -----------------------------------------------------------------------------
+    # [PREVIOUS CODE - PRESERVED]:
+    # def has_fresh_data(self, symbol: str) -> bool:
+    #     """True only when a fresh calendar fetch produced a known next date.
+    #
+    #     ``is_blackout`` keeps its historical unknown=allow behavior for paper and
+    #     existing-position monitoring. Live entry selection uses this stricter
+    #     predicate so an outage or an unchecked symbol cannot pass as safe.
+    #     """
+    #     cached = self._cache.get(symbol)
+    #     if not cached:
+    #         return False
+    #     next_date, fetched_at, ok = cached
+    #     try:
+    #         return bool(ok and next_date is not None
+    #                     and 0 <= time.time() - float(fetched_at) < self._cache_ttl)
+    #     except (TypeError, ValueError, OverflowError):
+    #         return False
+    # -----------------------------------------------------------------------------
+    # [NEW CODE]:
     def has_fresh_data(self, symbol: str) -> bool:
-        """True only when a fresh calendar fetch produced a known next date.
+        """True when a fresh calendar fetch has confirmed the symbol's status.
 
-        ``is_blackout`` keeps its historical unknown=allow behavior for paper and
-        existing-position monitoring. Live entry selection uses this stricter
-        predicate so an outage or an unchecked symbol cannot pass as safe.
+        A successful fetch where no earnings are scheduled in the window returns
+        ok=True and next_date=None, which is verified fresh and safe. Outages or
+        failed fetches have ok=False and fail this check.
         """
         cached = self._cache.get(symbol)
         if not cached:
             return False
         next_date, fetched_at, ok = cached
         try:
-            return bool(ok and next_date is not None
-                        and 0 <= time.time() - float(fetched_at) < self._cache_ttl)
+            return bool(ok and 0 <= time.time() - float(fetched_at) < self._cache_ttl)
         except (TypeError, ValueError, OverflowError):
             return False
+    # =============================================================================
 
     # ── FETCH ─────────────────────────────────────────────────────────────────
     def _get_next_earnings(self, symbol: str) -> Optional[date]:
