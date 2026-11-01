@@ -33,6 +33,7 @@ class Scheduler:
         self._jobs: list = []
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._stop_event = threading.Event()
 
     def add(self, name: str, fn: Callable, interval_secs: int) -> "Scheduler":
         self._jobs.append(_Job(name, fn, interval_secs))
@@ -40,19 +41,29 @@ class Scheduler:
         return self
 
     def start(self) -> None:
+        if self._running:
+            return
+        self._stop_event.clear()
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True, name="scheduler")
         self._thread.start()
 
     def stop(self) -> None:
         self._running = False
+        self._stop_event.set()
+        thread = self._thread
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=2.0)
+        self._thread = None
 
     def _loop(self) -> None:
-        while self._running:
+        while self._running and not self._stop_event.is_set():
             for job in self._jobs:
+                if not self._running or self._stop_event.is_set():
+                    break
                 if job.is_due():
                     job.run()
-            time.sleep(10)
+            self._stop_event.wait(10)
 
 
 def make_db_cleanup_job() -> Callable:
@@ -60,8 +71,13 @@ def make_db_cleanup_job() -> Callable:
     import db
 
     def _run():
-        db.execute("DELETE FROM price_bars WHERE bar_time < datetime('now', '-90 days', 'utc')")
-        db.execute("DELETE FROM rejected_signals WHERE rejected_at < datetime('now', '-7 days', 'utc')")
+        # Stored bars may be ISO-8601 with a `T`/offset while SQLite's
+        # datetime() returns a space-separated UTC string.  Text comparison then
+        # fails (and the cache grows forever); julianday normalizes both forms.
+        db.execute("DELETE FROM price_bars "
+                   "WHERE julianday(bar_time) < julianday('now', '-90 days')")
+        db.execute("DELETE FROM rejected_signals "
+                   "WHERE julianday(rejected_at) < julianday('now', '-7 days')")
 
     return _run
 
@@ -85,6 +101,7 @@ def make_daily_summary_job(portfolio, ml_engine, telegram_alerts) -> Callable:
 
 def make_retrain_job(ml_engine, broker=None) -> Callable:
     from config import Config
+    last_trained_resolved = [None]
 
     def _run():
         # Only retrain after-hours — never reshape the probability surface mid-session.
@@ -95,18 +112,22 @@ def make_retrain_job(ml_engine, broker=None) -> Callable:
             except Exception:
                 pass
         audit = ml_engine.audit()
-        if audit.get("resolved", 0) >= Config.MIN_TRAIN_SAMPLES:
+        resolved = audit.get("resolved", 0)
+        if (resolved >= Config.MIN_TRAIN_SAMPLES
+                and resolved != last_trained_resolved[0]):
             log.info("[Retrain] Triggering scheduled (after-hours) retraining…")
             ml_engine.train()
+            last_trained_resolved[0] = resolved
 
     return _run
 
 
 def make_portfolio_snapshot_job(portfolio) -> Callable:
     import db
+    from datetime import timedelta
 
     def _run():
-        today = datetime.now(timezone.utc).date().isoformat()
+        today = datetime.now(timezone(timedelta(hours=5, minutes=30))).date().isoformat()
         db.execute(
             """
             INSERT OR REPLACE INTO portfolio_snapshots (snap_date, bankroll, open_trades)

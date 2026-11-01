@@ -1,0 +1,26 @@
+# Repository/runtime metadata
+.git
+.gitignore
+.omnirush
+__pycache__
+*.py[cod]
+.venv
+venv
+
+# Secrets and local state
+.env
+.env.*
+!.env.example
+.getenv*
+*.local.json
+keys.local.json
+*.db
+*.db-*
+*.log
+*.log.*
+*.heartbeat
+tejas.paused
+
+# Retrained/generated model artifacts
+models/lgb_gold.txt
+models/*.pkl

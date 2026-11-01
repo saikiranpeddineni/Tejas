@@ -65,20 +65,35 @@ class DhanBroker(LiveBrokerBase):
         cash = float(d.get("availabelBalance", d.get("availableBalance", 0)) or 0)
         return {"cash": cash, "buying_power": cash, "portfolio_value": cash, "currency": "INR"}
 
-    def _place_entry(self, symbol, side, qty) -> Optional[dict]:
-        data = self._post(f"{BASE}/orders", json={
+    def _place_entry(self, symbol, side, qty, client_order_id: str = "") -> Optional[dict]:
+        payload = {
             "dhanClientId": self.client, "transactionType": side.upper(),
             "exchangeSegment": "NSE_EQ", "productType": self.product,
             "orderType": "MARKET", "validity": "DAY",
             "securityId": self._secid(symbol), "quantity": int(qty), "price": 0,
-        })
-        return {"id": data.get("orderId", ""), "symbol": symbol, "qty": qty}
+        }
+        if client_order_id:
+            payload["correlationId"] = client_order_id
+        body = self._post(f"{BASE}/orders", json=payload)
+        order_id = body.get("orderId", "") if isinstance(body, dict) else ""
+        return self._confirm_order(order_id, symbol, side, int(qty), client_order_id)
+
+    def _order_status(self, order_id: str, client_order_id: str = "") -> dict:
+        """Dhan's order-by-id endpoint returns the latest fill fields."""
+        record = self._get(f"{BASE}/orders/{order_id}")
+        if not isinstance(record, dict):
+            record = {}
+        return self._normalize_order_status(
+            record,
+            status=record.get("orderStatus"),
+            order_id=order_id,
+            client_order_id=client_order_id,
+            filled_qty=record.get("filledQty"),
+            filled_avg_price=record.get("averageTradedPrice"),
+        )
 
     def _flatten(self, symbol) -> Optional[dict]:
-        pos = self.get_position(symbol)
-        if not pos or int(pos.get("qty", 0)) == 0:
-            return {"symbol": symbol, "qty": 0}
-        return self._place_entry(symbol, "sell", abs(int(pos["qty"])))
+        return self._flatten_position(symbol)
 
     def _positions(self) -> List[dict]:
         data = self._get(f"{BASE}/positions") or []

@@ -8,6 +8,7 @@ All signals pass through 4 extra pre-filters before being ranked:
   ★ Sentiment edge boost (add 0.5% to edge for positive-news stocks)
 """
 import logging
+import math
 import time as _time
 import uuid
 from datetime import datetime, timezone
@@ -75,13 +76,29 @@ class SignalEngineGold:
             return []
 
         # ── ★ Pre-compute earnings blackout set (batch for efficiency) ──
-        blackout_set = self.earnings.get_blackout_set(symbols) if Config.USE_EARNINGS_GATE else set()
+        # Paper mode keeps the historical compatibility fallback. A live broker
+        # gets the same bounded pre-pass, but each candidate must also have a
+        # fresh, known calendar result before it can survive this scan.
+        strict_live = not getattr(Config, "PAPER_TRADING", True)
+        blackout_set = (
+            self.earnings.get_blackout_set(
+                symbols,
+                time_budget_secs=max(1.0, Config.EARNINGS_SCAN_BUDGET_SECS),
+                fail_closed=strict_live,
+            )
+            if Config.USE_EARNINGS_GATE else set()
+        )
         if blackout_set:
             log.info(f"[Scanner] Earnings blackout: {', '.join(sorted(blackout_set))}")
 
         signals: List[Signal] = []
         self.last_scores = {}
         screened = skipped_earnings = skipped_sentiment = 0
+        sentiment_deadline = (
+            _time.monotonic() + max(1.0, Config.SENTIMENT_SCAN_BUDGET_SECS)
+            if Config.USE_SENTIMENT_GATE else None
+        )
+        sentiment_budget_exhausted = False
 
         for symbol in symbols:
             bars  = bars_map.get(symbol, [])
@@ -93,15 +110,38 @@ class SignalEngineGold:
             screened += 1
 
             # ── ★ Earnings blackout ────────────────────────────────
-            if symbol in blackout_set:
-                skipped_earnings += 1
-                continue
+            if Config.USE_EARNINGS_GATE:
+                if strict_live and not self.earnings.has_fresh_data(symbol):
+                    skipped_earnings += 1
+                    log.warning(f"[Scanner] {symbol}: blocked — earnings data unavailable/stale")
+                    continue
+                if symbol in blackout_set:
+                    skipped_earnings += 1
+                    continue
 
             # ── ★ Sentiment gate (hard block on very negative) ────
-            if Config.USE_SENTIMENT_GATE and self.sentiment.is_blocked(symbol):
-                skipped_sentiment += 1
-                log.info(f"[Scanner] {symbol}: blocked by negative sentiment")
-                continue
+            if Config.USE_SENTIMENT_GATE:
+                # News is an external request per symbol. Never let a large
+                # universe or an upstream outage stretch a scan indefinitely and
+                # starve the exit monitor. The safe result for the unchecked tail
+                # is to stop ranking it this cycle, including in paper mode.
+                if sentiment_budget_exhausted or _time.monotonic() >= sentiment_deadline:
+                    if not sentiment_budget_exhausted:
+                        sentiment_budget_exhausted = True
+                        log.warning(
+                            f"[Scanner] sentiment screen stopped at {screened}/{len(symbols)} "
+                            "(budget); unchecked symbols skipped this cycle"
+                        )
+                    break
+                sentiment_blocked = self.sentiment.is_blocked(symbol)
+                if strict_live and not self.sentiment.has_fresh_data(symbol):
+                    skipped_sentiment += 1
+                    log.warning(f"[Scanner] {symbol}: blocked — sentiment data unavailable/stale")
+                    continue
+                if sentiment_blocked:
+                    skipped_sentiment += 1
+                    log.info(f"[Scanner] {symbol}: blocked by negative sentiment")
+                    continue
 
             sig = self._evaluate(symbol, bars, quote, regime)
             if sig is not None:
@@ -116,24 +156,32 @@ class SignalEngineGold:
         # consecutive-failure breaker — on 2026-07-06 a network outage made each
         # fetch burn ~10s in retries and an unbounded pass over 100+ signals
         # wedged the whole cycle for >20min (positions unmonitored, no entries).
-        # Anything unchecked passes through untouched (fail open).
+        # Paper mode keeps unchecked names for responsiveness. In live mode an
+        # unchecked tail is not eligible: a bounded screen must fail closed rather
+        # than turn its time budget into an implicit allow.
         skipped_fundamentals = 0
         if Config.USE_FUNDAMENTALS_GATE and signals:
             top_n   = Config.MAX_TRADES_PER_CYCLE + Config.MAX_ROTATIONS_PER_CYCLE + 10
-            budget  = _time.monotonic() + 45.0
+            budget  = _time.monotonic() + max(1.0, Config.FUNDAMENTALS_SCAN_BUDGET_SECS)
             consec_fail = 0
             kept = []
             for i, s in enumerate(signals):
                 if i >= top_n or _time.monotonic() > budget or consec_fail >= 6:
-                    kept.extend(signals[i:])   # unchecked tail passes through
+                    if not strict_live:
+                        kept.extend(signals[i:])   # paper compatibility fallback
                     if i < len(signals) and (consec_fail >= 6 or _time.monotonic() > budget):
+                        suffix = "blocked for live entries" if strict_live else "rest unchecked"
                         log.warning(f"[Scanner] fundamentals screen stopped at "
-                                    f"{i}/{len(signals)} (budget/feed) — rest unchecked")
+                                    f"{i}/{len(signals)} (budget/feed) — {suffix}")
                     break
                 data = self.fundamentals.get(s.symbol)
                 consec_fail = consec_fail + 1 if (
                     s.symbol in self.fundamentals._cache
                     and self.fundamentals._cache[s.symbol][2] is False) else 0
+                if strict_live and not self.fundamentals.has_fresh_data(s.symbol):
+                    skipped_fundamentals += 1
+                    log.warning(f"[Scanner] {s.symbol}: blocked — fundamental data unavailable/stale")
+                    continue
                 if not self.fundamentals.is_viable(s.symbol):
                     skipped_fundamentals += 1
                     log.info(f"[Scanner] {s.symbol}: blocked — fragile fundamentals "
@@ -162,22 +210,35 @@ class SignalEngineGold:
         quote: Optional[Quote],
         regime: Dict,
     ) -> Optional[Signal]:
-        current_price = quote.mid if quote and quote.mid > 0 else bars[-1].close
+        try:
+            current_price = float(quote.mid) if quote and quote.mid > 0 else float(bars[-1].close)
+        except (TypeError, ValueError, IndexError):
+            return None
+        if not math.isfinite(current_price) or current_price <= 0:
+            return None
         if current_price < Config.MIN_PRICE or current_price > Config.MAX_PRICE:
             return None
-        if quote and quote.spread_pct > Config.MAX_SPREAD_PCT:
-            return None
+        if quote:
+            try:
+                spread_pct = float(quote.spread_pct)
+            except (TypeError, ValueError):
+                return None
+            if (not math.isfinite(spread_pct) or spread_pct < 0 or
+                    spread_pct > Config.MAX_SPREAD_PCT):
+                return None
 
         # ── ★ Liquidity floor: require real ₹ turnover so entry/exit slippage
         #   stays negligible vs position size (a relative volume ratio can't catch
         #   an absolutely thin micro-cap). Previously configured but never enforced.
         if Config.MIN_ADV_VALUE > 0:
             recent = bars[-Config.ADV_LOOKBACK_DAYS:]
-            advs = sorted(b.close * b.volume for b in recent if b.volume)
-            if advs:
-                adv = advs[len(advs) // 2]   # median daily traded value (₹)
-                if adv < Config.MIN_ADV_VALUE:
-                    return None
+            advs = sorted(b.close * b.volume for b in recent
+                          if b.volume and math.isfinite(b.close) and b.close > 0)
+            if not advs:
+                return None
+            adv = advs[len(advs) // 2]   # median daily traded value (₹)
+            if adv < Config.MIN_ADV_VALUE:
+                return None
 
         trade_id = str(uuid.uuid4())[:12]
         features = self.builder.build(symbol, bars, quote, trade_id=trade_id)
@@ -224,8 +285,11 @@ class SignalEngineGold:
         stop_loss   = max(stop_loss,   current_price * (1 - Config.STOP_MAX_PCT))
         take_profit = min(take_profit, current_price * 1.15)
 
-        log.info(f"[Analyst] {symbol}: {view['thesis']} "
-                 f"(score={view['composite']:+.2f} edge={adjusted_edge:.3f} conf={conf:.2f})")
+        # This runs once per symbol in a potentially 500-name scan. Keep the
+        # detailed rationale available for debug sessions without filling the
+        # rotating production log and delaying stop monitoring.
+        log.debug(f"[Analyst] {symbol}: {view['thesis']} "
+                  f"(score={view['composite']:+.2f} edge={adjusted_edge:.3f} conf={conf:.2f})")
 
         # ★ The WHY — one line a human can audit later, persisted with the trade
         # and sent in the entry alert. (Fundamentals health is appended by the

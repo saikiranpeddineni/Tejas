@@ -4,8 +4,10 @@ telegram_alerts.py — Telegram Notifications for Tejas (NSE)
 Telegram alerts for every trade event, timestamped in IST (NSE session tz).
 """
 import logging
+import os
 import threading
 from datetime import datetime, timezone
+from html import escape as _html_escape
 
 import requests
 
@@ -13,6 +15,25 @@ from config import Config
 from models import Portfolio, Signal, Trade
 
 log = logging.getLogger(__name__)
+_REQUEST_EXCEPTION = getattr(requests, "RequestException", Exception)
+
+
+_SECRET_ENV_NAMES = (
+    "TELEGRAM_BOT_TOKEN", "KITE_API_KEY", "KITE_ACCESS_TOKEN",
+    "UPSTOX_ACCESS_TOKEN", "SMARTAPI_API_KEY", "SMARTAPI_JWT",
+    "DHAN_ACCESS_TOKEN", "DHAN_CLIENT_ID", "FYERS_APP_ID",
+    "FYERS_ACCESS_TOKEN", "ALPHA_VANTAGE_KEY",
+)
+
+
+def _safe_text(value) -> str:
+    """Escape external/model text and redact configured credentials."""
+    text = str(value)
+    secrets = {Config.TELEGRAM_BOT_TOKEN, *(os.getenv(name, "") for name in _SECRET_ENV_NAMES)}
+    for secret in secrets:
+        if secret and len(secret) >= 4:
+            text = text.replace(secret, "[REDACTED]")
+    return _html_escape(text, quote=True)
 
 
 def _send(msg: str, parse_mode: str = "HTML") -> bool:
@@ -28,8 +49,15 @@ def _send(msg: str, parse_mode: str = "HTML") -> bool:
         )
         resp.raise_for_status()
         return True
+    except _REQUEST_EXCEPTION as e:
+        # Request exceptions can contain the full URL, which includes the bot
+        # token.  Never write that value to the local log.
+        status = getattr(getattr(e, "response", None), "status_code", None)
+        suffix = f" HTTP {status}" if status else ""
+        log.error("[Telegram] Send failed%s (%s)", suffix, type(e).__name__)
+        return False
     except Exception as e:
-        log.error(f"[Telegram] Send failed: {e}")
+        log.error("[Telegram] Send failed (%s)", type(e).__name__)
         return False
 
 
@@ -63,7 +91,7 @@ def alert_offline_gap(minutes: float, symbols: list) -> None:
     msg = (
         f"<b>⚠️ Tejas was OFFLINE {minutes:.0f} min during market hours</b>\n"
         f"Open positions were UNMONITORED (no stop protection):\n"
-        f"📦 {', '.join(symbols) if symbols else 'none'}\n"
+        f"📦 {_safe_text(', '.join(symbols) if symbols else 'none')}\n"
         f"SL/TP re-armed — any gapped-through stop exits at the current price.\n"
         f"⏰ {ist_time()}"
     )
@@ -88,14 +116,14 @@ def alert_trade_entry(signal: Signal, trade: Trade) -> None:
     sl_pct = (ep - trade.stop_loss) / ep if ep > 0 else 0.0
     tp_pct = (trade.take_profit - ep) / ep if ep > 0 else 0.0
     msg = (
-        f"<b>{mode} BUY | {trade.symbol}</b>\n"
+        f"<b>{mode} BUY | {_safe_text(trade.symbol)}</b>\n"
         f"💵 Size: <b>₹{trade.size_usd:,.2f}</b> @ ₹{trade.entry_price:.2f}\n"
         f"🛡️ Stop: ₹{trade.stop_loss:.2f} ({sl_pct:.1%})\n"
         f"🎯 Target: ₹{trade.take_profit:.2f} ({tp_pct:.1%})\n"
         f"🤖 ML Prob: {signal.ml_prob:.1%} | Edge: {signal.edge:+.3f}\n"
         f"📊 RSI: {signal.features.rsi_14*100:.0f} | "
         f"Vol: {signal.features.volume_ratio:.1f}x avg\n"
-        + (f"💡 Why: {trade.rationale}\n" if getattr(trade, "rationale", "") else "")
+        + (f"💡 Why: {_safe_text(trade.rationale)}\n" if getattr(trade, "rationale", "") else "")
         + f"⏰ {ist_time()}"
     )
     _async_send(msg)
@@ -105,7 +133,7 @@ def alert_partial_tp(trade: Trade) -> None:
     """★ Staged exit leg 1: half booked at first target, stop moved to breakeven."""
     gain = ((trade.trim_price or 0) - trade.entry_price) / max(trade.entry_price, 0.01)
     msg = (
-        f"<b>✂️ TRIM | {trade.symbol}</b>\n"
+        f"<b>✂️ TRIM | {_safe_text(trade.symbol)}</b>\n"
         f"💰 Sold {trade.trim_shares:.0f}/{trade.shares:.0f} @ ₹{trade.trim_price:.2f} "
         f"({gain:+.2%})\n"
         f"🛡️ Stop moved to breakeven: ₹{trade.stop_loss:.2f}\n"
@@ -119,9 +147,9 @@ def alert_trade_exit(trade: Trade) -> None:
     emoji = "✅ WIN" if trade.pnl_usd >= 0 else "❌ LOSS"
     dur = _duration(trade)
     msg = (
-        f"<b>{emoji} | {trade.symbol}</b>\n"
+        f"<b>{emoji} | {_safe_text(trade.symbol)}</b>\n"
         f"💰 PnL: <b>₹{trade.pnl_usd:+,.2f} ({trade.pnl_pct:+.2%})</b>\n"
-        f"📌 Exit: ₹{trade.exit_price:.2f} | Reason: {trade.exit_reason}\n"
+        f"📌 Exit: ₹{trade.exit_price:.2f} | Reason: {_safe_text(trade.exit_reason or '')}\n"
         f"⏱ Held: {dur}\n"
         f"⏰ {ist_time()}"
     )
@@ -156,8 +184,18 @@ def alert_daily_summary(portfolio: Portfolio, ml) -> None:
 def alert_error(context: str, error: Exception) -> None:
     msg = (
         f"🔴 <b>ERROR</b>\n"
-        f"📍 {context}\n"
-        f"💬 {str(error)[:200]}\n"
+        f"📍 {_safe_text(context)}\n"
+        f"💬 {_safe_text(str(error)[:200])}\n"
+        f"⏰ {ist_time()}"
+    )
+    _async_send(msg)
+
+
+def alert_system_message(message: str) -> None:
+    """Send arbitrary system alerts (e.g., drift detection, fatal loops)."""
+    msg = (
+        f"🚨 <b>SYSTEM ALERT</b>\n"
+        f"{_safe_text(message)}\n"
         f"⏰ {ist_time()}"
     )
     _async_send(msg)
@@ -165,7 +203,20 @@ def alert_error(context: str, error: Exception) -> None:
 
 def _duration(trade: Trade) -> str:
     if trade.exit_time and trade.entry_time:
-        delta = trade.exit_time - trade.entry_time
+        # Legacy SQLite rows may contain naive UTC timestamps while newly
+        # created trades use aware UTC timestamps. Normalize both sides before
+        # subtraction so a notification cannot crash the close path.
+        start = trade.entry_time
+        end = trade.exit_time
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        else:
+            start = start.astimezone(timezone.utc)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=timezone.utc)
+        else:
+            end = end.astimezone(timezone.utc)
+        delta = end - start
         h, rem = divmod(int(delta.total_seconds()), 3600)
         m = rem // 60
         return f"{h}h {m}m"

@@ -72,9 +72,13 @@ _EXTREME_NEGATIVE = {
 
 class SentimentEngine:
     def __init__(self):
-        # Cache: symbol → ((score, n_relevant), fetched_at)
+        # Cache: symbol → ((score, n_relevant), fetched_at). Keep feed health
+        # separate so the paper-compatible neutral fallback cannot be mistaken for
+        # usable live-entry data.
         self._cache: Dict[str, tuple] = {}
+        self._health: Dict[str, tuple] = {}  # symbol → (checked_at, fetch_ok)
         self._cache_ttl = Config.SENTIMENT_CACHE_MINS * 60
+        self._last_fetch_ok = True
 
     # ── PUBLIC API ────────────────────────────────────────────────────────────
     def _score_and_count(self, symbol: str) -> tuple:
@@ -85,7 +89,9 @@ class SentimentEngine:
             if now - fetched_at < self._cache_ttl:
                 return val
 
+        self._last_fetch_ok = True
         val = self._fetch_yahoo_news(symbol)   # (score, n_relevant)
+        self._health[symbol] = (now, bool(self._last_fetch_ok))
 
         # Optional AlphaVantage supplement (only if a real key is configured)
         if abs(val[0]) < 0.1 and Config.ALPHA_VANTAGE_KEY not in ("", "demo"):
@@ -112,6 +118,26 @@ class SentimentEngine:
     def get_scores_bulk(self, symbols: List[str]) -> Dict[str, float]:
         """Get sentiment for multiple symbols efficiently."""
         return {sym: self.get_score(sym) for sym in symbols}
+
+    def has_fresh_data(self, symbol: str) -> bool:
+        """True only when a recent fetch succeeded and yielded relevant news.
+
+        The neutral ``(0.0, 0)`` result remains valid for paper monitoring, but it
+        is not enough evidence to permit a new live entry: an empty result can also
+        be an upstream outage hidden by the provider's compatibility fallback.
+        """
+        cached = self._cache.get(symbol)
+        health = self._health.get(symbol)
+        if not cached or not health:
+            return False
+        value, fetched_at = cached
+        checked_at, fetch_ok = health
+        try:
+            score, relevant = value
+            age = time.time() - min(float(fetched_at), float(checked_at))
+            return bool(fetch_ok and int(relevant) > 0 and 0 <= age < self._cache_ttl)
+        except (TypeError, ValueError, OverflowError):
+            return False
 
     def edge_adjustment(self, symbol: str) -> float:
         """
@@ -148,8 +174,13 @@ class SentimentEngine:
             articles = search_news(ysym, count=10)
             scores = []
             for a in articles:
-                tickers = {str(t).upper() for t in (a.get("relatedTickers") or [])}
-                title = (a.get("title") or "")
+                if not isinstance(a, dict):
+                    continue
+                raw_tickers = a.get("relatedTickers") or []
+                if isinstance(raw_tickers, str):
+                    raw_tickers = [raw_tickers]
+                tickers = {str(t).upper() for t in raw_tickers}
+                title = str(a.get("title") or "")
                 # ★ Whole-word matching everywhere. Raw substring matching blocked
                 # stocks on BULLISH headlines: "sec" ⊂ "sector", "cut" ⊂ "execute",
                 # and short roots misfired relevance ("LT" ⊂ "DEFAULT").
@@ -168,11 +199,13 @@ class SentimentEngine:
                 scores.append((bull - bear) / total if total else 0.0)
             if not scores:
                 return (0.0, 0)
-            return (float(sum(scores) / len(scores)), len(scores))
+            score = sum(scores) / len(scores)
+            return (float(max(-1.0, min(1.0, score))), len(scores))
         except Exception as e:
-            # Fail-open is the right call (a news outage must not halt trading),
-            # but at WARNING so the operator can see the gate has gone dark.
-            log.warning(f"[Sentiment] Yahoo news failed {symbol} — gate inactive this cycle: {e}")
+            # Preserve the neutral fallback for paper/monitoring, but record the
+            # failed fetch so live-entry callers can fail closed explicitly.
+            self._last_fetch_ok = False
+            log.warning(f"[Sentiment] Yahoo news failed {symbol} — live entry blocked: {e}")
             return (0.0, 0)
 
     # ── ALPHAVANTAGE SENTIMENT ────────────────────────────────────────────────
@@ -196,20 +229,32 @@ class SentimentEngine:
             resp.raise_for_status()
             data = resp.json()
 
-            if "feed" not in data:
+            feed = data.get("feed") if isinstance(data, dict) else None
+            if not isinstance(feed, list):
                 return 0.0
 
             scores = []
-            for article in data["feed"][:10]:
-                for ticker_info in article.get("ticker_sentiment", []):
-                    if ticker_info.get("ticker", "").upper() == symbol.upper():
+            for article in feed[:10]:
+                if not isinstance(article, dict):
+                    continue
+                ticker_sentiment = article.get("ticker_sentiment") or []
+                if not isinstance(ticker_sentiment, list):
+                    continue
+                for ticker_info in ticker_sentiment:
+                    if not isinstance(ticker_info, dict):
+                        continue
+                    if str(ticker_info.get("ticker", "")).upper() == symbol.upper():
                         try:
                             score = float(ticker_info.get("ticker_sentiment_score", 0))
-                            scores.append(score)
+                            if score == score and score not in (float("inf"), float("-inf")):
+                                scores.append(score)
                         except (ValueError, TypeError):
                             pass
 
-            return float(sum(scores) / len(scores)) if scores else 0.0
+            if not scores:
+                return 0.0
+            score = sum(scores) / len(scores)
+            return float(max(-1.0, min(1.0, score)))
 
         except Exception as e:
             log.debug(f"[Sentiment] AlphaVantage failed {symbol}: {e}")

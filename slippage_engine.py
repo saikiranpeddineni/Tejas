@@ -46,8 +46,22 @@ class SlippageEngine:
         Returns total expected slippage as a fraction of price.
         e.g. 0.0015 = 0.15% slippage
         """
+        try:
+            price = float(price); order_usd = float(order_usd)
+            adv_usd = float(adv_usd); spread_pct = float(spread_pct)
+            volatility = float(volatility); urgency = float(urgency)
+        except (TypeError, ValueError):
+            return 0.0
+        if not all(math.isfinite(v) for v in
+                   (price, order_usd, adv_usd, spread_pct, volatility, urgency)):
+            return 0.0
         if price <= 0 or order_usd <= 0:
             return 0.0
+
+        adv_usd = max(adv_usd, 1.0)
+        spread_pct = max(0.0, spread_pct)
+        volatility = max(0.0, volatility)
+        urgency = min(1.0, max(0.0, urgency))
 
         # ── Component 1: Spread Cost ───────────────────────────────────────
         # Always pay half the spread (crossing bid-ask)

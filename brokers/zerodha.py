@@ -45,19 +45,42 @@ class ZerodhaBroker(LiveBrokerBase):
         return {"cash": cash, "buying_power": cash,
                 "portfolio_value": float(eq.get("net", cash) or cash), "currency": "INR"}
 
-    def _place_entry(self, symbol, side, qty) -> Optional[dict]:
-        data = self._post(f"{BASE}/orders/regular", data={
+    def _place_entry(self, symbol, side, qty, client_order_id: str = "") -> Optional[dict]:
+        payload = {
             "exchange": "NSE", "tradingsymbol": symbol,
             "transaction_type": side.upper(), "quantity": int(qty),
             "order_type": "MARKET", "product": self.product, "validity": "DAY",
-        }).get("data", {})
-        return {"id": data.get("order_id", ""), "symbol": symbol, "qty": qty}
+        }
+        if client_order_id:
+            payload["tag"] = client_order_id
+        body = self._post(f"{BASE}/orders/regular", data=payload)
+        data = body.get("data", {}) if isinstance(body, dict) else {}
+        order_id = data.get("order_id", "") if isinstance(data, dict) else ""
+        return self._confirm_order(order_id, symbol, side, int(qty), client_order_id)
+
+    def _order_status(self, order_id: str, client_order_id: str = "") -> dict:
+        """Kite order history: the last row is the current order state."""
+        body = self._get(f"{BASE}/orders/{order_id}")
+        records = body.get("data", []) if isinstance(body, dict) else body
+        if isinstance(records, dict):
+            records = [records]
+        records = records if isinstance(records, list) else []
+        matches = [
+            record for record in records
+            if isinstance(record, dict)
+            and str(record.get("order_id", record.get("orderId", ""))) == str(order_id)
+        ]
+        record = matches[-1] if matches else {}
+        return self._normalize_order_status(
+            record,
+            order_id=order_id,
+            client_order_id=client_order_id,
+            filled_qty=record.get("filled_quantity") if record else None,
+            filled_avg_price=record.get("average_price") if record else None,
+        )
 
     def _flatten(self, symbol) -> Optional[dict]:
-        pos = self.get_position(symbol)
-        if not pos or int(pos.get("qty", 0)) == 0:
-            return {"symbol": symbol, "qty": 0}
-        return self._place_entry(symbol, "sell", abs(int(pos["qty"])))
+        return self._flatten_position(symbol)
 
     def _positions(self) -> List[dict]:
         net = self._get(f"{BASE}/portfolio/positions").get("data", {}).get("net", [])

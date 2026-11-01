@@ -15,10 +15,9 @@ PORTFOLIO BETA explained:
   build a supercharged market exposure beyond your risk tolerance.
 """
 import logging
+import math
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
-
-import numpy as np
+from typing import Dict, List, Optional
 
 from brokers.base import BaseBroker
 from config import Config
@@ -29,12 +28,16 @@ log = logging.getLogger(__name__)
 _SECTOR_NAMES = {0:"technology",1:"finance",2:"healthcare",
                  3:"consumer",4:"energy",5:"etf",6:"other"}
 
-# Approximate stock betas vs SPY (used when live beta unavailable)
+# Approximate stock betas vs NIFTY 50. Anything unmapped defaults to 1.0 —
+# the old table held US tickers (NVDA/TSLA/SPY…), so every NSE stock silently
+# got the default anyway while implying real coverage. A handful of high-beta
+# NSE names are seeded; refine over time from live regression if needed.
 _APPROX_BETA = {
-    "NVDA":1.8,"TSLA":2.0,"AMD":1.7,"SHOP":1.6,"SNOW":1.5,"MRNA":1.4,
-    "ARKK":1.8,"META":1.2,"GOOGL":1.1,"AAPL":1.1,"MSFT":1.0,"AMZN":1.1,
-    "JPM":1.0,"GS":1.2,"BAC":1.1,"XOM":0.9,"CVX":0.8,"GLD":0.2,
-    "TLT":0.0,"SPY":1.0,"QQQ":1.1,"IWM":1.2,"VXX":-2.0,  # VXX = inverse market
+    "TATAMOTORS":1.6, "TATASTEEL":1.5, "JSWSTEEL":1.4, "HINDALCO":1.5,
+    "VEDL":1.7, "ADANIENT":1.6, "ADANIPORTS":1.5, "ZOMATO":1.8,
+    "PAYTM":1.9, "NYKAA":1.6, "IRCTC":1.3, "YESBANK":1.7,
+    "HDFCBANK":1.0, "ICICIBANK":1.05, "SBIN":1.2, "INFY":0.9,
+    "TCS":0.8, "ITC":0.7, "HINDUNILVR":0.6, "NTPC":0.9, "COALINDIA":1.1,
 }
 
 
@@ -44,6 +47,67 @@ class DynamicRiskManager:
         self._daily_pnl = 0.0         # track P&L within the trading day
         self._daily_pnl_date = None   # date of last reset
         self._recent_exits: Dict[str, datetime] = {}   # symbol -> last exit time (re-entry cooldown)
+
+    # ── ★ RESTART-PROOF STATE ────────────────────────────────────────────────
+    def restore_state_from_db(self) -> None:
+        """Rebuild the daily-loss breaker and re-entry cooldowns from the trades
+        table. Both lived only in memory, and the supervisor restarts the bot
+        twice a day — so a fresh process forgot every loss booked since its
+        start: the 4%/day circuit breaker could never accumulate across
+        restarts, and a just-sold name could be instantly re-bought."""
+        try:
+            import db as _db
+            from brokers.base import IST
+            import datetime as _dt
+            today = self.broker._now_ist().date() if hasattr(self.broker, "_now_ist") \
+                else _dt.datetime.now(IST).date()
+            # Re-seed from the ledger, rather than adding to an existing seed;
+            # this keeps the method idempotent if startup/recovery invokes it
+            # more than once on the same trading day.
+            self._daily_pnl = 0.0
+            self._daily_pnl_date = today
+
+            # Realized P&L closed TODAY (IST) — seed the daily breaker.
+            rows = _db.fetchall(
+                "SELECT pnl_usd, exit_time FROM trades "
+                "WHERE status='closed' AND exit_time IS NOT NULL"
+            )
+            day_start = _dt.datetime.combine(today, _dt.time.min, tzinfo=IST)
+            seeded = 0.0
+            for r in rows:
+                try:
+                    et = _dt.datetime.fromisoformat(str(r["exit_time"]))
+                    if et.tzinfo is None:
+                        et = et.replace(tzinfo=_dt.timezone.utc)
+                    if et.astimezone(IST) >= day_start:
+                        seeded += float(r["pnl_usd"] or 0)
+                except Exception:
+                    continue
+            self._daily_pnl += seeded
+
+            # Re-entry cooldowns: exits in the last REENTRY_COOLDOWN_HOURS.
+            now = _dt.datetime.now(_dt.timezone.utc)
+            for r in _db.fetchall(
+                "SELECT symbol, MAX(exit_time) AS ex FROM trades "
+                "WHERE status='closed' AND exit_time IS NOT NULL GROUP BY symbol"
+            ):
+                try:
+                    et = _dt.datetime.fromisoformat(str(r["ex"]))
+                    if et.tzinfo is None:
+                        et = et.replace(tzinfo=_dt.timezone.utc)
+                    hrs = (now - et).total_seconds() / 3600.0
+                    if 0 <= hrs < Config.REENTRY_COOLDOWN_HOURS:
+                        self._recent_exits[r["symbol"]] = et
+                except Exception:
+                    continue
+
+            if seeded:
+                log.warning(f"[Risk] Restored ₹{seeded:,.0f} of today's realized P&L "
+                            f"into the daily-loss breaker (restart-proof)")
+            if self._recent_exits:
+                log.info(f"[Risk] Restored {len(self._recent_exits)} re-entry cooldown(s)")
+        except Exception as e:
+            log.warning(f"[Risk] state restore skipped: {e}")
 
     # ── MAIN APPROVAL ─────────────────────────────────────────────────────────
     def approve(
@@ -55,7 +119,14 @@ class DynamicRiskManager:
         regime: Dict,
     ) -> Optional[float]:
         """Returns approved USD size or None to reject."""
-        bankroll = portfolio.bankroll
+        try:
+            bankroll = float(portfolio.bankroll)
+            raw_size = float(raw_size)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(bankroll) or bankroll <= 0 or not math.isfinite(raw_size) or raw_size <= 0:
+            log.warning("[Risk] Invalid bankroll or candidate size — rejecting")
+            return None
 
         # ── 1. DRAWDOWN HALT ──────────────────────────────────────
         if portfolio.drawdown >= Config.MAX_DRAWDOWN_HALT:
@@ -111,22 +182,55 @@ class DynamicRiskManager:
                 return None
             raw_size = avail
 
-        # ── 7. TOTAL EXPOSURE CAP ─────────────────────────────────
-        if portfolio.total_exposure >= bankroll * 0.85:
-            log.warning("[Risk] Total exposure cap (85%)")
+        # ── 7. TOTAL EXPOSURE CAP & ELITE RESERVE ─────────────────
+        # Normal cap is 70%. The last 15% (up to 85%) is reserved ONLY for
+        # exceptional, high-conviction setups so we never miss the best trades.
+        total_exposure = float(portfolio.total_exposure)
+        if not math.isfinite(total_exposure) or total_exposure < 0:
+            log.warning("[Risk] Invalid portfolio exposure — rejecting")
             return None
+        exposure_ratio = total_exposure / bankroll
+
+        if exposure_ratio >= 0.85:
+            log.warning("[Risk] Absolute total exposure cap (85%)")
+            return None
+
+        if exposure_ratio >= 0.70:
+            if signal.analyst_score < 0.40:
+                log.info(f"[Risk] Reserve tier active: rejecting {signal.symbol} (score {signal.analyst_score:.2f} < 0.40)")
+                return None
+
+        # Cap the resulting book, not only the book before this order. Without
+        # this headroom clamp an 80%-deployed portfolio could add a full-sized
+        # order and cross the absolute 85% exposure limit.
+        exposure_headroom = bankroll * 0.85 - total_exposure
+        if exposure_headroom < Config.MIN_POSITION_USD:
+            log.warning("[Risk] Total exposure cap leaves no enterable headroom")
+            return None
+        raw_size = min(raw_size, exposure_headroom)
 
         # ── 8. ★ PORTFOLIO BETA CAP ───────────────────────────────
         port_beta = self._estimate_portfolio_beta(portfolio.open_trades)
         new_beta  = _APPROX_BETA.get(signal.symbol, 1.0)
-        if port_beta + (new_beta * raw_size / bankroll) > Config.MAX_PORTFOLIO_BETA:
-            # Reduce size to stay within beta cap
-            beta_headroom = max(0, Config.MAX_PORTFOLIO_BETA - port_beta)
-            if beta_headroom < 0.05:
+        if not math.isfinite(port_beta) or not math.isfinite(new_beta) or new_beta <= 0:
+            log.warning("[Risk] Invalid beta estimate — rejecting")
+            return None
+        # port_beta is an exposure-weighted average. Compare it with the same
+        # quantity after adding the candidate; the old expression added a
+        # dimensionless average beta to a beta×capital fraction.
+        combined_exposure = total_exposure + raw_size
+        combined_beta = ((port_beta * total_exposure) + (new_beta * raw_size)) / combined_exposure
+        if combined_beta > Config.MAX_PORTFOLIO_BETA and new_beta > Config.MAX_PORTFOLIO_BETA:
+            beta_headroom = Config.MAX_PORTFOLIO_BETA - port_beta
+            if beta_headroom <= 0:
                 log.warning(f"[Risk] Portfolio beta cap ({port_beta:.2f})")
                 return None
-            raw_size = min(raw_size, (beta_headroom / new_beta) * bankroll)
+            raw_size = min(raw_size, (beta_headroom * total_exposure) /
+                           (new_beta - Config.MAX_PORTFOLIO_BETA))
             log.info(f"[Risk] Beta-capped size: ₹{raw_size:.2f} (portfolio β={port_beta:.2f})")
+        elif combined_beta > Config.MAX_PORTFOLIO_BETA:
+            log.warning(f"[Risk] Portfolio beta cap ({combined_beta:.2f})")
+            return None
 
         # ── 9. AVAILABLE CAPITAL ──────────────────────────────────
         if portfolio.available_capital < raw_size:
@@ -142,8 +246,17 @@ class DynamicRiskManager:
         dd_factor   = max(0.3, 1. - portfolio.drawdown * 4)
 
         size = raw_size * dd_factor
-        size = max(Config.MIN_POSITION_USD, min(size, Config.MAX_POSITION_USD))
-        size = min(size, bankroll * Config.MAX_POSITION_PCT, portfolio.available_capital)
+        size = min(size, Config.MAX_POSITION_USD, bankroll * Config.MAX_POSITION_PCT,
+                   portfolio.available_capital)
+        # ★ Reject instead of inflating: the old `max(MIN_POSITION, …)` forced a
+        # capped-down size BACK UP to the minimum — e.g. after the beta cap or the
+        # capital clamp shrank an order below ₹5,000 it was silently bumped up
+        # again, overriding the very limit that shrank it. A signal that can no
+        # longer be sized at/above the minimum is simply not enterable.
+        if not math.isfinite(size) or size < Config.MIN_POSITION_USD:
+            log.info(f"[Risk] ⤫ {signal.symbol}: residual size ₹{size:.0f} < min "
+                     f"₹{Config.MIN_POSITION_USD:.0f} after caps — reject")
+            return None
 
         log.info(
             f"[Risk] ✓ ₹{size:.2f} | {signal.symbol} β={new_beta:.1f} "
@@ -151,45 +264,6 @@ class DynamicRiskManager:
             f"dd={portfolio.drawdown:.1%}"
         )
         return round(size, 2)
-
-    # ── ★ ATR-BASED STOP/TARGET CALCULATION ──────────────────────────────────
-    def calculate_stops(
-        self,
-        entry_price: float,
-        atr_pct: float,
-        regime: Dict,
-    ) -> Tuple[float, float]:
-        """
-        Calculate dynamic stop loss and take profit based on ATR.
-        Wider stops in high-vol regimes (to avoid premature stop-outs).
-        """
-        atr = entry_price * atr_pct
-
-        # ATR multiplier adjusts for regime volatility
-        regime_name = regime.get("regime", "bull_low_vol")
-        atr_stop_mult = {
-            "bull_low_vol":   1.5,
-            "bull_high_vol":  2.0,   # wider in choppy conditions
-            "bear_low_vol":   1.5,
-            "bear_high_vol":  2.5,   # widest in danger zone
-            "range_low_vol":  1.5,
-            "range_high_vol": 2.0,
-            "extreme_fear":   3.0,
-        }.get(regime_name, 2.0)
-
-        risk_per_share = atr * atr_stop_mult
-        stop_loss   = entry_price - risk_per_share
-        take_profit = entry_price + (risk_per_share * Config.TAKE_PROFIT_RR)
-
-        # Clamp to config min/max
-        max_stop = entry_price * (1. - Config.STOP_MIN_PCT)
-        min_stop = entry_price * (1. - Config.STOP_MAX_PCT)
-        stop_loss = max(min_stop, min(stop_loss, max_stop))
-
-        max_tp = entry_price * 1.15   # cap take profit at 15%
-        take_profit = min(take_profit, max_tp)
-
-        return round(stop_loss, 2), round(take_profit, 2)
 
     # ── PORTFOLIO BETA ESTIMATION ─────────────────────────────────────────────
     def _estimate_portfolio_beta(self, open_trades: List[Trade]) -> float:
@@ -229,6 +303,8 @@ class DynamicRiskManager:
         )
 
     def close_trade(self, trade: Trade, portfolio: Portfolio) -> None:
+        if not any(t.trade_id == trade.trade_id for t in portfolio.open_trades):
+            return
         portfolio.open_trades = [t for t in portfolio.open_trades if t.trade_id != trade.trade_id]
         # NOTE: normally do NOT `portfolio.bankroll += pnl` here — equity is
         # refreshed from the broker every cycle, which already reflects realized

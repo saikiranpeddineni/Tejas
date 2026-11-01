@@ -3,7 +3,8 @@ tejas.py — Tejas Live Trading Entry Point
 ==============================================
 THE MAIN RUNNER. Start with:
     python tejas.py               # paper trading (DRY_RUN=true in .env)
-    DRY_RUN=false python tejas.py # live trading
+    # Live entries also require ENABLE_LIVE_TRADING=true and
+    # LIVE_TRADING_ACK=I_UNDERSTAND_LIVE_TRADING; otherwise monitor-only.
 
 Architecture (NSE equity; market data from Yahoo, orders via an Indian broker):
   RegimeEngine      → India-VIX/trend-based market regime detection
@@ -29,6 +30,8 @@ SAFETY LAYERS (must pass ALL before any order fires):
 """
 import json
 import logging
+import math
+import logging.handlers
 import os
 import signal as _signal_mod
 import sys
@@ -40,6 +43,7 @@ import db
 import edge_engine
 import telegram_alerts
 from brokers import get_broker
+from brokers.base import quote_is_fresh
 from config import Config
 from dynamic_risk import DynamicRiskManager
 from earnings_filter import EarningsFilter
@@ -53,12 +57,19 @@ from scheduler import build_scheduler
 from sentiment_engine import SentimentEngine
 from signal_engine_gold import SignalEngineGold
 
+# ★ Rotating log: the old append-forever FileHandler grew tejas.log past 270MB
+# (per-symbol analyst lines × every 30s cycle). 25MB × 4 backups caps disk use
+# while keeping days of history.
+LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tejas.log")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)-8s %(name)s — %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     handlers=[
-        logging.FileHandler("tejas.log", mode="a", encoding="utf-8"),
+        logging.handlers.RotatingFileHandler(
+            LOG_PATH, mode="a", encoding="utf-8",
+            maxBytes=25 * 1024 * 1024, backupCount=4),
         logging.StreamHandler(sys.stdout),
     ],
 )
@@ -222,43 +233,62 @@ def _restore_open_trades(portfolio: Portfolio) -> None:
 def _dict_to_feature_vector(
     trade_id: str, symbol: str, timestamp: datetime, d: dict
 ) -> FeatureVector:
-    """Reconstruct FeatureVector from stored JSON dict."""
+    """Reconstruct FeatureVector from stored JSON dict.
+
+    Older/runtime-corrupted rows must not make an open position disappear from
+    the in-memory book on restart. Invalid numeric values fall back to the same
+    neutral defaults used by FeatureVector.
+    """
+    if not isinstance(d, dict):
+        d = {}
+
+    def value(name: str, default: float) -> float:
+        try:
+            result = float(d.get(name, default))
+            return result if math.isfinite(result) else default
+        except (TypeError, ValueError):
+            return default
+
     return FeatureVector(
         trade_id=trade_id, symbol=symbol, timestamp=timestamp,
-        price_vs_sma20=float(d.get("price_vs_sma20", 0.0)),
-        price_vs_ema9=float(d.get("price_vs_ema9", 0.0)),
-        ema9_vs_ema21=float(d.get("ema9_vs_ema21", 0.0)),
-        rsi_14=float(d.get("rsi_14", 0.5)),
-        momentum_5d=float(d.get("momentum_5d", 0.0)),
-        momentum_10d=float(d.get("momentum_10d", 0.0)),
-        momentum_20d=float(d.get("momentum_20d", 0.0)),
-        rate_of_change=float(d.get("rate_of_change", 0.0)),
-        macd_histogram=float(d.get("macd_histogram", 0.0)),
-        macd_trend=float(d.get("macd_trend", 0.0)),
-        atr_pct=float(d.get("atr_pct", 0.02)),
-        bb_position=float(d.get("bb_position", 0.5)),
-        bb_squeeze=float(d.get("bb_squeeze", 0.02)),
-        volatility_20d=float(d.get("volatility_20d", 0.2)),
-        volume_ratio=float(d.get("volume_ratio", 1.0)),
-        volume_trend=float(d.get("volume_trend", 0.0)),
-        vwap_deviation=float(d.get("vwap_deviation", 0.0)),
-        spy_corr=float(d.get("spy_corr", 0.5)),
-        relative_strength=float(d.get("relative_strength", 0.0)),
-        sector_strength=float(d.get("sector_strength", 0.0)),
-        sector_code=int(d.get("sector_code", 6)),
+        price_vs_sma20=value("price_vs_sma20", 0.0),
+        price_vs_ema9=value("price_vs_ema9", 0.0),
+        ema9_vs_ema21=value("ema9_vs_ema21", 0.0),
+        rsi_14=value("rsi_14", 0.5),
+        momentum_5d=value("momentum_5d", 0.0),
+        momentum_10d=value("momentum_10d", 0.0),
+        momentum_20d=value("momentum_20d", 0.0),
+        rate_of_change=value("rate_of_change", 0.0),
+        macd_histogram=value("macd_histogram", 0.0),
+        macd_trend=value("macd_trend", 0.0),
+        atr_pct=value("atr_pct", 0.02),
+        bb_position=value("bb_position", 0.5),
+        bb_squeeze=value("bb_squeeze", 0.02),
+        volatility_20d=value("volatility_20d", 0.2),
+        volume_ratio=value("volume_ratio", 1.0),
+        volume_trend=value("volume_trend", 0.0),
+        vwap_deviation=value("vwap_deviation", 0.0),
+        spy_corr=value("spy_corr", 0.5),
+        relative_strength=value("relative_strength", 0.0),
+        sector_strength=value("sector_strength", 0.0),
+        sector_code=int(value("sector_code", 6)),
+        candle_stability=value("candle_stability", 0.5),
         # Gold features
-        williams_r=float(d.get("williams_r", 0.5)),
-        stoch_k=float(d.get("stoch_k", 0.5)),
-        stoch_d=float(d.get("stoch_d", 0.5)),
-        cci=float(d.get("cci", 0.0)),
-        obv_trend=float(d.get("obv_trend", 0.0)),
-        mfi=float(d.get("mfi", 0.5)),
-        dist_52w_high=float(d.get("dist_52w_high", 0.2)),
-        dist_52w_low=float(d.get("dist_52w_low", 0.5)),
-        price_vs_ema200=float(d.get("price_vs_ema200", 0.0)),
-        higher_highs=float(d.get("higher_highs", 0.5)),
-        intraday_range_ratio=float(d.get("intraday_range_ratio", 1.0)),
-        bid_ask_spread=float(d.get("bid_ask_spread", 0.001)),
+        williams_r=value("williams_r", 0.5),
+        stoch_k=value("stoch_k", 0.5),
+        stoch_d=value("stoch_d", 0.5),
+        cci=value("cci", 0.0),
+        obv_trend=value("obv_trend", 0.0),
+        mfi=value("mfi", 0.5),
+        dist_52w_high=value("dist_52w_high", 0.2),
+        dist_52w_low=value("dist_52w_low", 0.5),
+        price_vs_ema200=value("price_vs_ema200", 0.0),
+        higher_highs=value("higher_highs", 0.5),
+        intraday_range_ratio=value("intraday_range_ratio", 1.0),
+        bid_ask_spread=value("bid_ask_spread", 0.001),
+        market_trend_20d=value("market_trend_20d", 0.0),
+        market_vol_20d=value("market_vol_20d", 0.0),
+        trend_alignment=value("trend_alignment", 0.5),
     )
 
 
@@ -332,6 +362,16 @@ def _prevalidate_entry(signal, portfolio, regime, ml, quiet: bool = False):
     (used for the rotation pre-check so we don't spam the log).
     """
     f = signal.features
+    try:
+        entry_price = float(signal.entry_price)
+        stop_loss = float(signal.stop_loss)
+        take_profit = float(signal.take_profit)
+    except (TypeError, ValueError):
+        return False, "gate", 0.0, 0.0, 0.0
+    if (not all(math.isfinite(v) for v in (entry_price, stop_loss, take_profit))
+            or entry_price <= 0 or stop_loss <= 0
+            or stop_loss >= entry_price or take_profit <= entry_price):
+        return False, "gate", 0.0, 0.0, 0.0
 
     def _skip(msg, reason):
         if not quiet:
@@ -363,17 +403,20 @@ def _prevalidate_entry(signal, portfolio, regime, ml, quiet: bool = False):
         ml_prob=signal.ml_prob, entry_quality=entry_quality,
         bankroll=portfolio.bankroll, drawdown=portfolio.drawdown,
         regime_mult=regime.get("size_mult", 1.0),
+        tp_pct=(take_profit - entry_price) / entry_price,
+        sl_pct=(entry_price - stop_loss) / entry_price,
     )
     if raw_size < Config.MIN_POSITION_USD:
         return _skip(f"[Main] ⤫ {signal.symbol}: size ₹{raw_size:.0f} "
                      f"< min ₹{Config.MIN_POSITION_USD:.0f} (kelly={kelly_pct:.1%}) — skip", "size")
 
     if Config.USE_VIABILITY_GATE:
-        tp_pct = (signal.take_profit - signal.entry_price) / signal.entry_price
-        sl_pct = max(1e-4, (signal.entry_price - signal.stop_loss) / signal.entry_price)
+        tp_pct = (take_profit - entry_price) / entry_price
+        sl_pct = max(1e-4, (entry_price - stop_loss) / entry_price)
         v = edge_engine.trade_viability(
             p=signal.ml_prob, target_pct=tp_pct, stop_pct=sl_pct,
             price=signal.entry_price, bankroll=portfolio.bankroll, order_usd=raw_size,
+            adv_usd=Config.MIN_ADV_VALUE,
             spread_pct=max(0.0005, signal.features.bid_ask_spread),
             volatility=signal.features.atr_pct, min_edge=Config.MIN_NET_EDGE,
         )
@@ -390,8 +433,17 @@ def _attempt_entry(signal, portfolio, regime, ml, exec_e, risk_mgr):
     never drift apart.
 
     Returns (trade_or_None, reason) where reason ∈
-        {"entered", "gate", "size", "risk", "failed"}.
+        {"entered", "gate", "size", "risk", "failed", "dry_run"}.
     """
+    # Final in-process guard: every path that can reach broker entry (normal scan
+    # and rotation) must independently prove that live orders were explicitly
+    # enabled. This still leaves the exit/monitor path untouched.
+    if Config.LIVE_MODE:
+        allowed, reason = Config.live_entry_status()
+        if not allowed:
+            log.warning(f"[Main] ⤫ {signal.symbol}: live entry guard blocked — {reason}")
+            return None, "gate"
+
     ok, reason, entry_quality, kelly_pct, raw_size = _prevalidate_entry(
         signal, portfolio, regime, ml
     )
@@ -413,6 +465,8 @@ def _attempt_entry(signal, portfolio, regime, ml, exec_e, risk_mgr):
         kelly_pct=kelly_pct, entry_quality=entry_quality,
     )
     if not trade:
+        if getattr(exec_e, "last_was_dry_run", False):
+            return None, "dry_run"
         log.warning(f"[Main] Order failed for {signal.symbol}")
         return None, "failed"
 
@@ -438,21 +492,31 @@ def _hours_held(entry_time: datetime, now: datetime) -> float:
 
 
 def _feed_stale(broker) -> bool:
-    """True if the price feed looks stale (don't open new positions on it).
+    """True if required market data is unavailable or stale for new entries.
 
-    Checks the market-index quote's *exchange* timestamp. A missing quote or one
-    older than MAX_QUOTE_STALENESS_MINS means our data source is degraded — during
-    which the safe action is to halt new entries rather than trade on old prices.
-    (Threshold is generous to tolerate Yahoo's normal delay; it targets hours/days-
-    stale data, not a 15-minute lag.)"""
-    if getattr(Config, "IGNORE_MARKET_HOURS", False):
+    Existing positions are monitored before this gate. In paper mode the legacy
+    ``IGNORE_MARKET_HOURS`` test override remains available; a live broker never
+    bypasses the exchange-timestamp check and also needs a valid market bar set for
+    the regime calculation.
+    """
+    live_mode = not getattr(Config, "PAPER_TRADING", True)
+    if getattr(Config, "IGNORE_MARKET_HOURS", False) and not live_mode:
         return False
     try:
         q = broker.get_quote(Config.MARKET_INDEX_SYMBOL, force=True)
-        if q is None:
+        if q is None or not quote_is_fresh(q):
             return True
-        age_min = (datetime.now(timezone.utc) - q.timestamp).total_seconds() / 60.0
-        return age_min > getattr(Config, "MAX_QUOTE_STALENESS_MINS", 30)
+        if live_mode:
+            bars = broker.get_bars(Config.MARKET_INDEX_SYMBOL, "1Day", limit=2)
+            if not bars:
+                return True
+            latest = bars[-1]
+            close = float(getattr(latest, "close", 0.0))
+            if not math.isfinite(close) or close <= 0:
+                return True
+        return False
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return True
     except Exception:
         return True
 
@@ -606,12 +670,39 @@ def _keep_system_awake(enable: bool) -> None:
         pass
 
 
-def _write_heartbeat() -> None:
+def _write_heartbeat() -> bool:
+    tmp_path = f"{HEARTBEAT_PATH}.tmp.{os.getpid()}"
     try:
-        with open(HEARTBEAT_PATH, "w", encoding="utf-8") as f:
+        with open(tmp_path, "w", encoding="utf-8") as f:
             f.write(datetime.now(timezone.utc).isoformat())
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, HEARTBEAT_PATH)
+        return True
     except OSError:
-        pass
+        log.error("[Main] Heartbeat write failed — live entries remain blocked")
+        return False
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def _heartbeat_age_seconds():
+    """Return the age of the previous heartbeat; infinity means unusable."""
+    try:
+        with open(HEARTBEAT_PATH, encoding="utf-8") as f:
+            stamp = datetime.fromisoformat(f.read().strip())
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        age = (datetime.now(timezone.utc) - stamp.astimezone(timezone.utc)).total_seconds()
+        if age < -5.0:
+            return float("inf")
+        return max(0.0, age)
+    except (OSError, ValueError, TypeError, OverflowError):
+        return float("inf")
 
 
 def _offline_gap_minutes() -> float:
@@ -640,12 +731,49 @@ def _offline_gap_minutes() -> float:
     return total
 
 
+def _restore_equity_peak(start_pv: float) -> float:
+    """Highest equity ever snapshotted (or the current value if higher).
+
+    ★ The drawdown halt measured only the CURRENT process's peak before this:
+    the supervisor stops the bot at 15:45 and restarts it at 09:05, so peak
+    reset every morning and MAX_DRAWDOWN_HALT could never see a multi-day
+    decline. The daily portfolio_snapshots table already records bankroll —
+    use its max as the true high-water mark."""
+    try:
+        start = float(start_pv)
+        if not math.isfinite(start) or start <= 0:
+            start = 0.0
+    except (TypeError, ValueError):
+        start = 0.0
+    try:
+        row = db.fetchone("SELECT MAX(bankroll) AS mx FROM portfolio_snapshots")
+        hist_peak = float(row["mx"] or 0) if row else 0.0
+        if not math.isfinite(hist_peak) or hist_peak <= 0:
+            hist_peak = 0.0
+    except (TypeError, ValueError, OverflowError):
+        hist_peak = 0.0
+    except Exception:
+        hist_peak = 0.0
+    return max(start, hist_peak)
+
+
 def main() -> None:
     _signal_mod.signal(_signal_mod.SIGINT,  _signal_handler)
     _signal_mod.signal(_signal_mod.SIGTERM, _signal_handler)
 
-    mode = "📋 PAPER" if Config.PAPER_TRADING else "🔴 LIVE"
-    dry  = " [DRY RUN — no real orders]" if Config.DRY_RUN else " [ORDERS ACTIVE]"
+    live_entries_allowed, live_entry_reason = Config.live_entry_status()
+    if Config.PAPER_TRADING:
+        mode = "📋 PAPER"
+    elif live_entries_allowed:
+        mode = "🔴 LIVE"
+    else:
+        mode = "🔴 LIVE / MONITOR-ONLY"
+    if Config.DRY_RUN:
+        dry = " [DRY RUN — no real orders]"
+    elif Config.LIVE_MODE and not live_entries_allowed:
+        dry = " [NEW LIVE ENTRIES DISABLED — monitoring/exits only]"
+    else:
+        dry = " [ORDERS ACTIVE]"
 
     if not _acquire_single_instance():
         log.error("[Main] Another Tejas instance is already running — exiting "
@@ -657,6 +785,12 @@ def main() -> None:
     log.info(f" DB:      {Config.DB_PATH}")
     log.info(f" Capital: ₹{Config.BANKROLL:,.2f}")
     log.info(f" MinEdge: {Config.MIN_EDGE:.1%}  MaxDD: {Config.MAX_DRAWDOWN_HALT:.0%}  MaxPos: {Config.MAX_OPEN_POSITIONS}")
+    if not Config.PAPER_TRADING:
+        if live_entries_allowed:
+            log.info("[Main] Live-entry acknowledgement and required data gates are enabled")
+        else:
+            log.warning(f"[Main] 🛑 New live entries disabled — {live_entry_reason}; "
+                        "existing positions remain monitored/exitable")
     try:
         from universe import get_universe
         _u, _ = get_universe()
@@ -677,27 +811,42 @@ def main() -> None:
     regime_e  = RegimeEngine(broker)
     risk_mgr  = DynamicRiskManager(broker)
     exec_e    = ExecutionEngine(broker, ml)
-    exit_e    = ExitEngine(broker, ml, builder)
+    exit_e    = ExitEngine(broker, ml, builder, earnings=earnings)
 
     # ── Portfolio state ────────────────────────────────────────────────────
     live_pv = broker.get_portfolio_value()
     if not Config.PAPER_TRADING and live_pv <= 0:
-        # A LIVE broker that can't return account equity almost always means auth
-        # is broken. Refuse to start rather than trade against a guessed bankroll.
+        # Keep the process alive so restored live positions can still be monitored
+        # and exited. The first loop's account_ok gate blocks new entries until a
+        # real account value is available; Config.BANKROLL is sizing-only fallback
+        # and is never treated as live equity while the account is unhealthy.
         log.error("[Main] 🛑 LIVE broker returned no account value (auth/account "
-                  "failure) — refusing to start. Fix broker credentials first.")
-        sys.exit(1)
+                  "failure) — monitoring only; new entries blocked until it recovers.")
     start_pv = live_pv if live_pv > 0 else Config.BANKROLL
     log.info(f"[Main] Portfolio value: ₹{start_pv:,.2f}")
 
-    portfolio = Portfolio(bankroll=start_pv, peak_bankroll=start_pv)
+    portfolio = Portfolio(bankroll=start_pv, peak_bankroll=_restore_equity_peak(start_pv))
     _restore_open_trades(portfolio)
+    # ★ Restart-proof breakers: seed the daily-loss circuit breaker and re-entry
+    #   cooldowns from the trades ledger (both used to reset to zero on every
+    #   supervisor restart, disarming 4%-/day protection mid-day).
+    risk_mgr.restore_state_from_db()
 
     # ── ★ Offline-gap audit + keep-awake ───────────────────────────────────
     # >10 in-session minutes = a real outage (normal supervisor restarts land
     # well under that), and only worth shouting about if positions were exposed.
     gap_mins = _offline_gap_minutes()
-    _write_heartbeat()   # fresh baseline now, so a crash loop can't re-alert
+    previous_heartbeat_age = _heartbeat_age_seconds()
+    startup_monitor_only = bool(
+        Config.LIVE_MODE and portfolio.open_trades and (
+            gap_mins > 10
+            or previous_heartbeat_age > getattr(Config, "MAX_HEARTBEAT_AGE_SECS", 180)
+        )
+    )
+    heartbeat_ok = _write_heartbeat()   # fresh baseline now, so a crash loop can't re-alert
+    if Config.LIVE_MODE and not heartbeat_ok:
+        live_entries_allowed = False
+        live_entry_reason = "heartbeat file is not writable"
     if gap_mins > 10 and portfolio.open_trades:
         log.warning(
             f"[Main] ⚠️ OFFLINE {gap_mins:.0f} in-session min — "
@@ -713,6 +862,19 @@ def main() -> None:
     # ── Scheduler (background jobs) ────────────────────────────────────────
     scheduler = build_scheduler(ml, portfolio, telegram_alerts, broker)
     scheduler.start()
+
+    # ── Reconciliation Engine (background jobs) ─────────────────────────────
+    from reconciliation_engine import ReconciliationEngine
+    recon_engine = ReconciliationEngine(broker, portfolio)
+    recon_engine.start()
+    # Verify the broker book synchronously before the first live-entry decision.
+    # The background interval is intentionally long for rate-limit discipline,
+    # but waiting five minutes before detecting an external/manual position is
+    # unsafe.
+    try:
+        recon_engine.reconcile()
+    except Exception as exc:
+        log.error("[Main] Initial reconciliation failed: %s", type(exc).__name__, exc_info=True)
 
     # ── Startup Telegram alert ─────────────────────────────────────────────
     telegram_alerts.alert_system_start(portfolio.bankroll, Config.PAPER_TRADING)
@@ -735,7 +897,15 @@ def main() -> None:
         try:
             cycle += 1
             cycle_start = time.monotonic()
-            _write_heartbeat()   # liveness marker for the offline-gap audit
+            previous_heartbeat_age = _heartbeat_age_seconds()
+            heartbeat_ok = _write_heartbeat()   # liveness marker for the offline-gap audit
+            heartbeat_healthy = bool(
+                heartbeat_ok
+                and previous_heartbeat_age <= getattr(Config, "MAX_HEARTBEAT_AGE_SECS", 180)
+            )
+            if Config.LIVE_MODE and not heartbeat_healthy:
+                log.warning("[Main] 🛑 Heartbeat age/write health failed — "
+                            "monitoring only; no new live entries this cycle")
 
             # ── Refresh live portfolio value ───────────────────────────────
             # ★ Not in DRY_RUN: the broker book never sees dry-run fills, so its
@@ -801,8 +971,8 @@ def main() -> None:
                             # mark so the trigger doesn't refire every cycle.
                             trade.trim_shares = -1.0
                         continue
-                    # ★ A failed LIVE flatten keeps the trade open & monitored —
-                    #   booking it closed would orphan real shares with no stop.
+                    # ★ A failed flatten keeps the trade open & monitored —
+                    #   booking it closed would orphan the broker position.
                     if not exec_e.close_trade(trade, exit_price, pnl_pct, reason):
                         telegram_alerts.alert_error(
                             f"EXIT {trade.symbol}", "broker flatten failed — retrying")
@@ -829,12 +999,19 @@ def main() -> None:
             mins_since_open = broker.minutes_since_open()
             mins_to_close   = broker.minutes_to_close()
 
-            # Don't enter trades in first 20min (volatile open) or last 35min
+            # Don't enter trades in first 20min (volatile open) or last 5min
             if mins_since_open >= 0 and mins_since_open < Config.TRADE_AFTER_OPEN_MIN:
                 wait = Config.TRADE_AFTER_OPEN_MIN - mins_since_open
                 log.info(f"[Main] Opening volatility window — wait {wait:.0f}min")
                 _sleep(min(60, wait * 60))
                 continue
+
+            if getattr(Config, "EOD_EXECUTION_ONLY", False):
+                window = getattr(Config, "EOD_EXECUTION_WINDOW_MINS", 60)
+                if mins_to_close > window:
+                    log.info(f"[Main] EOD mode active — no new entries until last {window}min ({mins_to_close:.0f}m left)")
+                    _sleep(60)
+                    continue
 
             if 0 < mins_to_close < Config.TRADE_BEFORE_CLOSE_MIN:
                 log.info(f"[Main] Pre-close — no new entries ({mins_to_close:.0f}min left)")
@@ -850,12 +1027,25 @@ def main() -> None:
                 _sleep(Config.SCAN_INTERVAL_SECS)
                 continue
 
-            # ── ★ Halt new entries on account/data-feed failure ────────────
+            # ── ★ Halt new entries on account/data/process health failure ───
             #   (open positions were already monitored above; this only blocks
-            #   OPENING new risk on a broken account or stale prices.)
-            if not account_ok or _feed_stale(broker):
-                if account_ok:
-                    log.warning("[Main] 🛑 Price feed stale — monitoring only, no new entries")
+            #   OPENING new risk on a broken account, stale feed, or stalled loop.)
+            entry_block_reason = None
+            if Config.LIVE_MODE and not live_entries_allowed:
+                entry_block_reason = live_entry_reason
+            elif Config.LIVE_MODE and startup_monitor_only:
+                entry_block_reason = "first cycle after an offline monitoring gap"
+            elif Config.LIVE_MODE and not heartbeat_healthy:
+                entry_block_reason = "heartbeat health is outside its bound"
+            elif Config.LIVE_MODE and not recon_engine.entries_safe():
+                entry_block_reason = "broker reconciliation is missing, stale, or drifted"
+            elif not account_ok:
+                entry_block_reason = "live account value unavailable"
+            elif _feed_stale(broker):
+                entry_block_reason = "market feed unavailable or stale"
+            if entry_block_reason:
+                log.warning(f"[Main] 🛑 New entries blocked — {entry_block_reason}; "
+                            "monitoring only")
                 signals = []
             else:
                 signals = sig_engine.scan(regime=regime)
@@ -899,6 +1089,11 @@ def main() -> None:
                     ml, exec_e, exit_e, risk_mgr, broker,
                 )
 
+            # The first post-restart monitor pass has now run. Do not keep the
+            # startup-only entry brake armed after the exposed positions were
+            # checked once.
+            startup_monitor_only = False
+
             # ── Per-cycle decision summary (always logged) ─────────────────
             log.info(
                 f"[Decision] cycle {cycle}: candidates={len(signals)} "
@@ -932,6 +1127,10 @@ def main() -> None:
     # ── Graceful shutdown ──────────────────────────────────────────────────
     log.info("[Main] Shutting down Tejas…")
     _keep_system_awake(False)   # let the PC sleep again outside the session
+    try:
+        recon_engine.stop()
+    except Exception:
+        pass
     try:
         scheduler.stop()
     except Exception:

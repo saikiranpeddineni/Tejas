@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import time
+from datetime import datetime, timedelta, timezone
 import urllib.request
 
 from config import Config
@@ -37,8 +38,13 @@ _CSV = {
 _mem = {"date": None, "index": None, "symbols": [], "sectors": {}}
 
 
+_IST = timezone(timedelta(hours=5, minutes=30))
+
+
 def _today() -> str:
-    return time.strftime("%Y-%m-%d")
+    # Cache rotation follows the NSE trading calendar, not the machine's local
+    # timezone (a UTC host is already on the next NSE date after 18:30 UTC).
+    return datetime.now(_IST).date().isoformat()
 
 
 def _industry_code(industry: str) -> int:
@@ -85,9 +91,15 @@ def get_universe():
     try:
         with open(CACHE, encoding="utf-8") as f:
             d = json.load(f)
-        if d.get("date") == _today() and d.get("index") == index and d.get("symbols"):
-            _mem.update(date=_today(), index=index, symbols=d["symbols"], sectors=d.get("sectors", {}))
-            return d["symbols"], d.get("sectors", {})
+        cached_symbols = d.get("symbols")
+        cached_sectors = d.get("sectors", {})
+        valid_symbols = (isinstance(cached_symbols, list)
+                         and all(isinstance(sym, str) and sym for sym in cached_symbols))
+        valid_sectors = isinstance(cached_sectors, dict)
+        if (d.get("date") == _today() and d.get("index") == index
+                and valid_symbols and bool(cached_symbols) and valid_sectors):
+            _mem.update(date=_today(), index=index, symbols=cached_symbols, sectors=cached_sectors)
+            return cached_symbols, cached_sectors
     except Exception:
         pass
 

@@ -8,7 +8,7 @@ of low-level hooks each concrete broker fills in:
     _fetch_bars(symbol, timeframe, limit, start) -> List[Bar]
     _fetch_quote(symbol)                         -> Optional[Quote]
     _account_info()                              -> dict   (cash, portfolio_value, buying_power)
-    _place_entry(symbol, side, qty)              -> dict   (must contain "id")
+    _place_entry(symbol, side, qty, client_order_id) -> dict (must contain "id")
     _flatten(symbol)                             -> dict
     _positions()                                 -> List[dict]
 
@@ -27,6 +27,7 @@ Everything market-structure-specific to India is shared here:
 import logging
 import math
 import time
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -51,6 +52,27 @@ NSE_HOLIDAYS = {
 }
 
 
+def quote_is_fresh(quote: Optional[Quote], max_age_mins: Optional[float] = None) -> bool:
+    """Return true only for a recent, exchange-timestamped quote."""
+    try:
+        stamp = quote.timestamp
+        if not isinstance(stamp, datetime):
+            return False
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        age_minutes = (
+            datetime.now(timezone.utc) - stamp.astimezone(timezone.utc)
+        ).total_seconds() / 60.0
+        if max_age_mins is None:
+            max_age_mins = getattr(Config, "MAX_QUOTE_STALENESS_MINS", 30.0)
+        max_age_mins = float(max_age_mins)
+        return math.isfinite(age_minutes) and math.isfinite(max_age_mins) and (
+            -5.0 <= age_minutes <= max_age_mins
+        )
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return False
+
+
 class BaseBroker:
     """Alpaca-compatible broker surface. Subclasses implement the low-level hooks."""
 
@@ -58,6 +80,11 @@ class BaseBroker:
 
     def __init__(self):
         self._quote_cache: Dict[str, Tuple[Quote, float]] = {}
+        # Reconciliation must distinguish a genuinely flat account from a
+        # failed position fetch.  The public API still returns [] for backward
+        # compatibility, while this flag carries the health bit for callers
+        # that need to fail closed.
+        self._last_positions_ok = False
 
     # ════════════════════════════════════════════════════════════════════════
     # LOW-LEVEL HOOKS — subclasses must implement
@@ -72,7 +99,7 @@ class BaseBroker:
     def _account_info(self) -> dict:
         raise NotImplementedError
 
-    def _place_entry(self, symbol: str, side: str, qty: int) -> Optional[dict]:
+    def _place_entry(self, symbol: str, side: str, qty: int, client_order_id: str = "") -> Optional[dict]:
         raise NotImplementedError
 
     def _flatten(self, symbol: str) -> Optional[dict]:
@@ -121,7 +148,15 @@ class BaseBroker:
         acc = self.get_account()
         if not acc:
             return 0.0
-        return float(acc.get("portfolio_value") or acc.get("cash") or 0.0)
+        if not isinstance(acc, dict):
+            log.error(f"[{self.name}] Account endpoint returned an invalid payload")
+            return 0.0
+        try:
+            value = float(acc.get("portfolio_value") or acc.get("cash") or 0.0)
+        except (TypeError, ValueError):
+            log.error(f"[{self.name}] Account returned a non-numeric portfolio value")
+            return 0.0
+        return value if math.isfinite(value) and value > 0 else 0.0
 
     # ════════════════════════════════════════════════════════════════════════
     # MARKET HOURS  (computed from IST wall clock — no API call)
@@ -168,6 +203,15 @@ class BaseBroker:
                 return q
         try:
             q = self._fetch_quote(symbol)
+            if q is not None and not isinstance(q, Quote):
+                log.warning(f"[{self.name}] Quote endpoint returned an invalid payload for {symbol}")
+                return None
+            if q is not None:
+                try:
+                    if not math.isfinite(float(q.mid)) or q.mid <= 0:
+                        return None
+                except (TypeError, ValueError):
+                    return None
             if q:
                 self._quote_cache[symbol] = (q, now)
             return q
@@ -180,10 +224,28 @@ class BaseBroker:
             return {}
         try:
             result = self._fetch_quotes_bulk(symbols)
+            if not isinstance(result, dict):
+                log.warning(f"[{self.name}] Bulk quote endpoint returned an invalid payload")
+                return {}
             now = time.monotonic()
-            for s, q in result.items():
-                self._quote_cache[s] = (q, now)
-            return result
+            valid = {}
+            for symbol, quote in result.items():
+                if not isinstance(symbol, str) or not isinstance(quote, Quote):
+                    continue
+                try:
+                    mid = float(quote.mid)
+                    spread = float(quote.spread_pct)
+                except (TypeError, ValueError):
+                    continue
+                if (not math.isfinite(mid) or mid <= 0
+                        or not math.isfinite(spread) or spread < 0):
+                    continue
+                valid[symbol] = quote
+                self._quote_cache[symbol] = (quote, now)
+            if len(valid) != len(result):
+                log.warning(f"[{self.name}] Bulk quote payload dropped "
+                            f"{len(result) - len(valid)} invalid quote(s)")
+            return valid
         except Exception as e:
             log.warning(f"[{self.name}] Bulk quote failed: {e}")
             return {}
@@ -194,7 +256,8 @@ class BaseBroker:
     def get_bars(self, symbol: str, timeframe: str = "1Day",
                  limit: int = 100, start: Optional[str] = None) -> List[Bar]:
         try:
-            return self._fetch_bars(symbol, timeframe, limit, start)
+            bars = self._fetch_bars(symbol, timeframe, limit, start)
+            return bars if isinstance(bars, list) else []
         except Exception as e:
             log.warning(f"[{self.name}] Bars failed {symbol}/{timeframe}: {e}")
             return []
@@ -204,7 +267,8 @@ class BaseBroker:
         if not symbols:
             return {}
         try:
-            return self._fetch_bars_bulk(symbols, timeframe, limit)
+            bars = self._fetch_bars_bulk(symbols, timeframe, limit)
+            return bars if isinstance(bars, dict) else {}
         except Exception as e:
             log.warning(f"[{self.name}] Bulk bars failed: {e}")
             return {}
@@ -212,22 +276,50 @@ class BaseBroker:
     # ════════════════════════════════════════════════════════════════════════
     # ORDERS
     # ════════════════════════════════════════════════════════════════════════
-    def _last_price(self, symbol: str) -> float:
-        q = self.get_quote(symbol, force=True)
-        if q and q.mid > 0:
-            return q.mid
+    def _last_price(self, symbol: str, force: bool = True) -> float:
+        q = self.get_quote(symbol, force=force)
+        if q:
+            try:
+                mid = float(q.mid)
+            except (TypeError, ValueError):
+                mid = 0.0
+            if math.isfinite(mid) and mid > 0:
+                return mid
         bars = self.get_bars(symbol, "1Day", limit=2)
-        return float(bars[-1].close) if bars else 0.0
+        try:
+            close = float(bars[-1].close) if bars else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+        return close if math.isfinite(close) and close > 0 else 0.0
 
     def _notional_to_qty(self, symbol: str, notional: float, price: float = 0.0) -> int:
+        try:
+            notional = float(notional)
+            price = float(price)
+        except (TypeError, ValueError):
+            return 0
+        if not math.isfinite(notional) or notional <= 0:
+            return 0
         if price <= 0:
             price = self._last_price(symbol)
-        if price <= 0:
+        if not math.isfinite(price) or price <= 0:
             return 0
         return int(math.floor(notional / price))
 
     def place_market_order(self, symbol: str, side: str, notional: float) -> Optional[dict]:
         """Market order sized by notional (₹). Converts to whole shares."""
+        side = str(side or "").strip().lower()
+        try:
+            notional = float(notional)
+        except (TypeError, ValueError):
+            log.warning(f"[{self.name}] Invalid order notional for {symbol}: {notional!r}")
+            return None
+        if side not in {"buy", "sell"}:
+            log.warning(f"[{self.name}] Invalid order side for {symbol}: {side!r}")
+            return None
+        if not symbol or not math.isfinite(notional) or notional <= 0:
+            log.warning(f"[{self.name}] Invalid market order: side={side!r} symbol={symbol!r} notional={notional!r}")
+            return None
         if Config.DRY_RUN:
             log.info(f"[DRY RUN] {side.upper()} ₹{notional:.2f} of {symbol}")
             return {"dry_run": True, "id": f"dry_{int(time.time())}", "symbol": symbol}
@@ -236,10 +328,33 @@ class BaseBroker:
         if qty < 1:
             log.warning(f"[{self.name}] {symbol}: notional ₹{notional:.0f} < 1 share — skipped")
             return None
+        existing = self._resolve_unresolved_order(symbol, side, requested_qty=qty)
+        if existing is not None:
+            # The broker's prior order already owns its original quantity. Do
+            # not compare that confirmed fill with the size of this new signal;
+            # a different signal size must never cause a known fill to be lost.
+            if self._validate_order_result(existing):
+                log.info(f"[{self.name}] Resolved prior order for {symbol}; no duplicate POST sent")
+                return existing
+            log.warning(f"[{self.name}] {symbol} has an unresolved prior order; new order blocked")
+            return None
+        # Keep the identifier short enough for broker order-tag fields while
+        # retaining enough entropy to correlate an ambiguous response.
+        client_order_id = self._new_client_order_id()
         try:
-            res = self._place_entry(symbol, side.lower(), qty)
+            res = self._place_entry(symbol, side.lower(), qty, client_order_id=client_order_id)
             if res:
-                log.info(f"[{self.name}] Order: {side.upper()} {qty} {symbol} | id={str(res.get('id',''))[:12]}")
+                if not isinstance(res, dict) or not str(res.get("id", "")).strip():
+                    # A 200 response without an order id is not a confirmed
+                    # submission. Do not create a local trade that cannot be
+                    # correlated or reconciled; the caller can retry after
+                    # checking the broker's order book.
+                    log.error(f"[{self.name}] Order response for {symbol} had no broker order id")
+                    return None
+                if not self._validate_order_result(res, requested_qty=qty):
+                    log.error(f"[{self.name}] Order for {symbol} was not confirmed filled; refusing to book it")
+                    return None
+                log.info(f"[{self.name}] Order: {side.upper()} {qty} {symbol} | id={str(res.get('id',''))[:12]} | cid={client_order_id}")
             return res
         except Exception as e:
             log.error(f"[{self.name}] Order failed {symbol}: {e}")
@@ -267,7 +382,20 @@ class BaseBroker:
             log.info(f"[DRY RUN] CLOSE position: {symbol}")
             return {"dry_run": True, "symbol": symbol}
         try:
-            return self._flatten(symbol)
+            result = self._flatten(symbol)
+            if result is not None and not isinstance(result, dict):
+                return None
+            # Adapters use qty=0 to report an already-flat position. Any real
+            # flatten submission must carry a broker order id; otherwise a
+            # successful HTTP response could be mistaken for a filled exit.
+            if (result and float(result.get("qty", 0) or 0) != 0 and
+                    not str(result.get("id", "")).strip()):
+                log.error(f"[{self.name}] Flatten response for {symbol} had no order id")
+                return None
+            if result and not self._validate_order_result(result):
+                log.error(f"[{self.name}] Flatten for {symbol} was not confirmed filled; keeping it open")
+                return None
+            return result
         except Exception as e:
             log.error(f"[{self.name}] Close position failed {symbol}: {e}")
             return None
@@ -276,13 +404,26 @@ class BaseBroker:
         """Sell part of a position (staged exit's first-target trim). Subclasses
         that support it implement `_sell_qty`; brokers without it return None and
         the execution engine simply skips trims (full SL/TP still work)."""
+        try:
+            qty = int(qty)
+        except (TypeError, ValueError):
+            return None
         if qty < 1:
             return None
         if Config.DRY_RUN:
             log.info(f"[DRY RUN] PARTIAL CLOSE {qty} of {symbol}")
             return {"dry_run": True, "symbol": symbol, "qty": qty}
         try:
-            return self._sell_qty(symbol, qty)
+            result = self._sell_qty(symbol, qty)
+            if result is None or not isinstance(result, dict):
+                return None
+            if float(result.get("qty", qty) or 0) > 0 and not str(result.get("id", "")).strip():
+                log.error(f"[{self.name}] Partial close response for {symbol} had no order id")
+                return None
+            if not self._validate_order_result(result, requested_qty=qty):
+                log.error(f"[{self.name}] Partial close for {symbol} was not confirmed filled")
+                return None
+            return result
         except NotImplementedError:
             return None
         except Exception as e:
@@ -292,13 +433,43 @@ class BaseBroker:
     def _sell_qty(self, symbol: str, qty: int) -> Optional[dict]:
         raise NotImplementedError
 
+    def _new_client_order_id(self) -> str:
+        """Return the stable client-order-id format used by live adapters."""
+        return f"tj_{uuid.uuid4().hex[:16]}"
+
+    def _validate_order_result(self, result: dict, requested_qty: Optional[int] = None) -> bool:
+        """Validate an order result at the broker boundary.
+
+        The simulated broker intentionally keeps the historical result shape and
+        therefore uses this permissive default.  LiveBrokerBase overrides it to
+        require a confirmed terminal fill with quantity and price.
+        """
+        return True
+
+    def _resolve_unresolved_order(self, symbol: str, side: str,
+                                  requested_qty: Optional[int] = None) -> Optional[dict]:
+        """Return a previously unresolved result, if the broker supports it.
+
+        Live adapters use this hook to prevent a second order POST after a
+        timeout or lost status response. Paper brokers have no unresolved live
+        order state and keep the default no-op behavior.
+        """
+        return None
+
     # ════════════════════════════════════════════════════════════════════════
     # POSITIONS
     # ════════════════════════════════════════════════════════════════════════
     def get_positions(self) -> List[dict]:
         try:
-            return self._positions()
+            positions = self._positions()
+            if positions is None or not isinstance(positions, list):
+                self._last_positions_ok = False
+                log.warning(f"[{self.name}] Position endpoint returned an invalid payload")
+                return []
+            self._last_positions_ok = True
+            return positions
         except Exception as e:
+            self._last_positions_ok = False
             log.warning(f"[{self.name}] Positions fetch failed: {e}")
             return []
 
@@ -306,4 +477,21 @@ class BaseBroker:
         for p in self.get_positions():
             if p.get("symbol") == symbol:
                 return p
+        return None
+
+    def _get_position_strict(self, symbol: str) -> Optional[dict]:
+        """Look up a position without converting broker failures into 'flat'.
+
+        ``get_positions()`` returns an empty list on a fetch failure for
+        backward compatibility with scanners. Flattening has a stricter safety
+        requirement: a failed position request must not be interpreted as no
+        position, otherwise a local trade can be marked closed while exchange
+        shares remain open and unprotected.
+        """
+        positions = self._positions()
+        if not isinstance(positions, list):
+            raise RuntimeError("position endpoint returned an invalid payload")
+        for position in positions or []:
+            if isinstance(position, dict) and position.get("symbol") == symbol:
+                return position
         return None

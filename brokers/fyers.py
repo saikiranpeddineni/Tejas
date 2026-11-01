@@ -52,20 +52,54 @@ class FyersBroker(LiveBrokerBase):
                 break
         return {"cash": cash, "buying_power": cash, "portfolio_value": cash, "currency": "INR"}
 
-    def _place_entry(self, symbol, side, qty) -> Optional[dict]:
-        data = self._post(f"{BASE}/orders/sync", json={
+    def _place_entry(self, symbol, side, qty, client_order_id: str = "") -> Optional[dict]:
+        payload = {
             "symbol": self._fy(symbol), "qty": int(qty), "type": 2,  # 2 = market
             "side": 1 if side.lower() == "buy" else -1,
             "productType": self.product, "limitPrice": 0, "stopPrice": 0,
             "validity": "DAY", "disclosedQty": 0, "offlineOrder": False,
-        })
-        return {"id": data.get("id", ""), "symbol": symbol, "qty": qty}
+        }
+        if client_order_id:
+            payload["orderTag"] = client_order_id
+        body = self._post(f"{BASE}/orders/sync", json=payload)
+        order_id = body.get("id", "") if isinstance(body, dict) else ""
+        # FYERS v3 identifies the order with the returned id; the client id is
+        # retained through _confirm_order for local correlation and logging.
+        return self._confirm_order(order_id, symbol, side, int(qty), client_order_id)
+
+    def _order_status(self, order_id: str, client_order_id: str = "") -> dict:
+        """FYERS orderbook-by-id returns the latest numeric order status."""
+        body = self._get(f"{BASE}/orders", params={"id": order_id})
+        records = body.get("orderBook", []) if isinstance(body, dict) else []
+        if isinstance(records, dict):
+            records = [records]
+        records = records if isinstance(records, list) else []
+        matches = [
+            record for record in records
+            if isinstance(record, dict)
+            and str(record.get("id", record.get("orderId", ""))) == str(order_id)
+        ]
+        record = matches[-1] if matches else {}
+        raw_status = record.get("status") if record else None
+        if isinstance(raw_status, str) and raw_status.strip().isdigit():
+            raw_status = int(raw_status.strip())
+        if isinstance(raw_status, (int, float)) and not isinstance(raw_status, bool):
+            raw_status = {
+                1: "CANCELLED", 2: "TRADED", 4: "TRANSIT", 5: "REJECTED",
+                6: "PENDING", 7: "PARTIALLY_FILLED", 8: "TRIGGER_PENDING",
+                9: "CANCEL_PENDING", 10: "MODIFY_PENDING",
+            }.get(int(raw_status), "UNKNOWN")
+        return self._normalize_order_status(
+            record,
+            status=raw_status,
+            order_id=order_id,
+            client_order_id=client_order_id,
+            filled_qty=record.get("filledQty") if record else None,
+            filled_avg_price=(record.get("avgPrice") or record.get("averagePrice")) if record else None,
+        )
 
     def _flatten(self, symbol) -> Optional[dict]:
-        pos = self.get_position(symbol)
-        if not pos or int(pos.get("qty", 0)) == 0:
-            return {"symbol": symbol, "qty": 0}
-        return self._place_entry(symbol, "sell", abs(int(pos["qty"])))
+        return self._flatten_position(symbol)
 
     def _positions(self) -> List[dict]:
         data = self._get(f"{BASE}/positions").get("netPositions", []) or []

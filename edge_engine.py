@@ -19,6 +19,7 @@ WHAT THIS VERSION DOES:
   ★ regime_adjusted_edge()— scales edge down in fear regimes
 """
 import logging
+import math
 from dataclasses import dataclass
 from typing import Tuple
 
@@ -61,7 +62,16 @@ def calculate_edge(
     Original formula: (p * move) - ((1-p) * risk)
     This version: same concept but with slippage deducted.
     """
-    if not (0 < p < 1) or move <= 0 or risk <= 0:
+    try:
+        finite = all(math.isfinite(float(v)) for v in
+                     (p, move, risk, price, order_usd, adv_usd, spread_pct, volatility))
+    except (TypeError, ValueError):
+        finite = False
+    if not finite:
+        return 0.0
+    if (not 0 < p < 1 or move <= 0 or risk <= 0 or price <= 0
+            or order_usd <= 0 or adv_usd <= 0 or spread_pct < 0
+            or volatility < 0):
         return 0.0
 
     # Gross EV (original formula, still correct)
@@ -89,6 +99,13 @@ def kelly_fraction(
 
     Kelly scale of 0.25 = "quarter Kelly" — standard risk management.
     """
+    try:
+        finite = all(math.isfinite(float(v)) for v in
+                     (p, win_pct, loss_pct, kelly_scale, max_fraction))
+    except (TypeError, ValueError):
+        finite = False
+    if not finite:
+        return 0.0
     if not (0 < p < 1) or win_pct <= 0 or loss_pct <= 0:
         return 0.0
 
@@ -121,6 +138,19 @@ def trade_viability(
     Full go/no-go trade assessment.
     Returns TradeViability with all metrics and a binary decision.
     """
+    try:
+        finite = all(math.isfinite(float(v)) for v in
+                     (p, target_pct, stop_pct, price, bankroll, order_usd, adv_usd,
+                      spread_pct, volatility, min_edge, kelly_scale, regime_mult))
+    except (TypeError, ValueError):
+        finite = False
+    if not finite:
+        return TradeViability(False, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                              "Invalid non-finite input")
+    if not (0 < p < 1) or target_pct <= 0 or stop_pct <= 0 or price <= 0 or bankroll <= 0 or order_usd <= 0:
+        return TradeViability(False, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                              "Invalid trade inputs")
+
     # ── Gross EV ──────────────────────────────────────────────────────────
     gross_ev = (p * target_pct) - ((1 - p) * stop_pct)
 

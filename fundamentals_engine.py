@@ -17,6 +17,7 @@ candidates per scan, NOT the 500-symbol universe loop — results are cached
 can't disarm the gate all day (mirrors EarningsFilter).
 """
 import logging
+import math
 import time
 from typing import Dict, Optional
 
@@ -37,7 +38,9 @@ def _raw(node: Optional[dict], *keys):
         cur = cur.get(k)
     if isinstance(cur, dict):
         cur = cur.get("raw")
-    return cur if isinstance(cur, (int, float)) else None
+    if isinstance(cur, bool) or not isinstance(cur, (int, float)):
+        return None
+    return float(cur) if math.isfinite(float(cur)) else None
 
 
 class FundamentalsEngine:
@@ -60,6 +63,23 @@ class FundamentalsEngine:
                         f"retry in {self._fail_ttl // 60}min")
         self._cache[symbol] = (data, time.time(), ok)
         return data
+
+    def has_fresh_data(self, symbol: str) -> bool:
+        """True only for a recent successful snapshot with usable data.
+
+        ``is_viable`` intentionally remains paper-compatible and treats unknown
+        fundamentals as non-blocking. Live entry code calls this stricter health
+        predicate before it can rely on that result.
+        """
+        cached = self._cache.get(symbol)
+        if not cached:
+            return False
+        data, fetched_at, ok = cached
+        try:
+            return bool(ok and data is not None
+                        and 0 <= time.time() - float(fetched_at) < self._cache_ttl)
+        except (TypeError, ValueError, OverflowError):
+            return False
 
     def _fetch(self, symbol: str) -> tuple:
         """Returns (data_or_None, ok). ok=False means the FETCH failed
@@ -111,8 +131,11 @@ class FundamentalsEngine:
         return "fine"
 
     def is_viable(self, symbol: str) -> bool:
-        """Gate: block only confirmed-fragile names. Unknown/missing data
-        fails OPEN — a data outage must not halt trading."""
+        """Gate: block only confirmed-fragile names.
+
+        Unknown/missing data remains fail-open for paper and monitoring callers;
+        live entry selection separately requires :meth:`has_fresh_data`.
+        """
         return self.health(symbol) != "fragile"
 
     # ── EDGE TILT ─────────────────────────────────────────────────────────────
