@@ -525,3 +525,62 @@ class AdaptiveFeedbackEngine:
         total_penalty = min(0.25, penalty)
         reason_str = "; ".join(reasons) if reasons else ""
         return total_penalty, reason_str
+
+    # =============================================================================
+    # [ADDED 2026-11-01]: Diagnostics summary for AlphaBot UI & Heartbeat synchronization
+    # ORIGINAL INTENT: The engine exposed individual query methods for risk checks.
+    # REASON FOR CHANGE: AlphaBot UI requires aggregated health and self-healing telemetry
+    # for /api/self-healing and /api/system/heartbeat.
+    # SAFE ROLLBACK: New helper method only; core trading logic is completely unchanged.
+    # -----------------------------------------------------------------------------
+    # [NEW CODE]:
+    def get_diagnostics_summary(self) -> Dict[str, Any]:
+        """Returns comprehensive self-healing telemetry for the UI and heartbeat."""
+        now = datetime.now(timezone.utc)
+        recent_4h = [t for t in self._macro_loss_times if (now - t).total_seconds() <= 4 * 3600]
+        
+        # Attribution breakdown
+        attributions: Dict[str, int] = {}
+        for pm in self._recent_losses:
+            cat = pm.attribution or "UNKNOWN"
+            attributions[cat] = attributions.get(cat, 0) + 1
+
+        # Active cooldowns
+        active_cooldowns: Dict[str, float] = {}
+        for sym in list(self._symbol_loss_history.keys()):
+            hours = self.get_symbol_cooldown_hours(sym)
+            if hours > 0:
+                active_cooldowns[sym] = round(hours, 1)
+
+        # Sector throttles
+        from dynamic_risk import _SECTOR_NAMES
+        sector_throttles: Dict[str, float] = {}
+        for code, name in _SECTOR_NAMES.items():
+            blocked, reason, mult = self.is_sector_throttled(name)
+            if mult < 1.0 or blocked:
+                sector_throttles[name] = round(mult, 2)
+
+        macro_factor = self.get_cluster_risk_multiplier()
+
+        return {
+            "total_postmortems": len(self._recent_losses),
+            "macro_losses_4h": len(recent_4h),
+            "macro_risk_factor": round(macro_factor, 2),
+            "macro_halted": macro_factor == 0.0,
+            "failure_attributions": attributions,
+            "active_cooldowns": active_cooldowns,
+            "sector_throttles": sector_throttles,
+            "recent_postmortems": [
+                {
+                    "trade_id": pm.trade_id,
+                    "symbol": pm.symbol,
+                    "pnl_pct": round(pm.pnl_pct, 2),
+                    "pnl_usd": round(pm.pnl_usd, 2),
+                    "exit_reason": pm.exit_reason,
+                    "attribution": pm.attribution,
+                    "exit_time": pm.exit_time.isoformat() if hasattr(pm.exit_time, "isoformat") else str(pm.exit_time)
+                }
+                for pm in reversed(self._recent_losses[-15:])
+            ]
+        }
+    # =============================================================================

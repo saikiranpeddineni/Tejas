@@ -38,3 +38,8 @@ Scope: Verify complete end-to-end implementation of the multi-tiered self-healin
   CHECK: .venv\Scripts\python.exe tests/run_gates.py autostart AUTOSTART_READINESS_VERIFIED_SUCCESS
   EXPECT: AUTOSTART_READINESS_VERIFIED_SUCCESS
   EVIDENCE: automatic-evidence=v1; definition-sha256=d75ede55c5f9e9d706d041195492ad56a3d80095206f6a012ebd219ee2e2b44a; exit=0; EXPECT=matched; output-sha256=590d2b718d11f4708b3bcada669bf56d122c11ef858020f0abef2f9ae5c0c366; output-bytes=148; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=a5bbb5f35938/58 entries
+
+- [x] G8: UI and top functionalities synchronized with AlphaBot architecture
+  CHECK: .venv\Scripts\python.exe tests/run_gates.py alphabot_sync ALPHABOT_SYNC_VERIFIED_SUCCESS
+  EXPECT: ALPHABOT_SYNC_VERIFIED_SUCCESS
+  EVIDENCE: automatic-evidence=v1; definition-sha256=7878625edbb92211349b7127fdddd2bd254f6c14d2511b6cfff77a9870775b5e; exit=0; EXPECT=matched; output-sha256=907f03fff3495e541e1c669e997017ec89200736c8fb53916b91d5aaf75ed598; output-bytes=142; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=a5bbb5f35938/58 entries
