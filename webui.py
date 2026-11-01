@@ -416,11 +416,29 @@ def start_bot(opts: dict, source: str = "ui") -> dict:
                     pass
             startup_log = open(startup_log_path, "ab")
             try:
+                # =============================================================================
+                # [MODIFIED 2026-11-01]: Virtualenv python resolution for bot child process
+                # ORIGINAL INTENT: Used sys.executable to launch tejas.py child.
+                # REASON FOR CHANGE: If webui is launched via system python, sys.executable lacks
+                # dependencies (joblib, lightgbm, etc.). Prioritize .venv/Scripts/python.exe.
+                # SAFE ROLLBACK: Preserved original implementation below as comments.
+                # -----------------------------------------------------------------------------
+                # [PREVIOUS CODE - PRESERVED]:
+                # bot_proc = subprocess.Popen(
+                #     [sys.executable, "-u", os.path.join(BASE_DIR, "tejas.py")],
+                #     cwd=BASE_DIR, env=env,
+                #     stdout=subprocess.DEVNULL, stderr=startup_log,
+                # )
+                # -----------------------------------------------------------------------------
+                # [NEW CODE]:
+                venv_py = os.path.join(BASE_DIR, ".venv", "Scripts", "python.exe")
+                py_bin = venv_py if os.path.exists(venv_py) else sys.executable
                 bot_proc = subprocess.Popen(
-                    [sys.executable, "-u", os.path.join(BASE_DIR, "tejas.py")],
+                    [py_bin, "-u", os.path.join(BASE_DIR, "tejas.py")],
                     cwd=BASE_DIR, env=env,
                     stdout=subprocess.DEVNULL, stderr=startup_log,
                 )
+                # =============================================================================
             finally:
                 startup_log.close()
             bot_started_at = time.time()

@@ -46,8 +46,40 @@ def _dashboard_up() -> bool:
         s.close()
 
 
+# =============================================================================
+# [MODIFIED 2026-11-01]: Morning Autostart & Virtualenv Resolution
+# ORIGINAL INTENT: Selected pythonw adjacent to sys.executable; suppressed browser with TEJAS_NO_BROWSER=1.
+# REASON FOR CHANGE: Task Scheduler often runs under global system Python lacking project dependencies
+# (causing ModuleNotFoundError: No module named 'joblib'). We prioritize .venv\Scripts\pythonw.exe
+# and allow browser auto-opening in the morning per user directive.
+# SAFE ROLLBACK: Preserved original implementation below as comments.
+# -----------------------------------------------------------------------------
+# [PREVIOUS CODE - PRESERVED]:
+# def _python_gui() -> str:
+#     """pythonw.exe (no console window) if available, else the current python."""
+#     cand = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+#     return cand if os.path.exists(cand) else sys.executable
+# 
+# 
+# def main() -> None:
+#     if _dashboard_up():
+#         return  # already running — nothing to do
+#     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+#     # Background launch: no console window, and no browser tab (must never pop
+#     # to the foreground / appear during screen sharing). Open the dashboard
+#     # yourself at http://127.0.0.1:8765 when you want to view it.
+#     env = dict(os.environ)
+#     env["TEJAS_NO_BROWSER"] = "1"
+# -----------------------------------------------------------------------------
+# [NEW CODE]:
 def _python_gui() -> str:
-    """pythonw.exe (no console window) if available, else the current python."""
+    """pythonw.exe (no console window) if available, prioritizing project .venv."""
+    venv_pyw = os.path.join(BASE_DIR, ".venv", "Scripts", "pythonw.exe")
+    if os.path.exists(venv_pyw):
+        return venv_pyw
+    venv_py = os.path.join(BASE_DIR, ".venv", "Scripts", "python.exe")
+    if os.path.exists(venv_py):
+        return venv_py
     cand = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
     return cand if os.path.exists(cand) else sys.executable
 
@@ -56,11 +88,13 @@ def main() -> None:
     if _dashboard_up():
         return  # already running — nothing to do
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-    # Background launch: no console window, and no browser tab (must never pop
-    # to the foreground / appear during screen sharing). Open the dashboard
-    # yourself at http://127.0.0.1:8765 when you want to view it.
     env = dict(os.environ)
-    env["TEJAS_NO_BROWSER"] = "1"
+    # Auto-open browser on morning launch unless explicitly suppressed by environment
+    if os.environ.get("TEJAS_NO_BROWSER") == "1":
+        env["TEJAS_NO_BROWSER"] = "1"
+    else:
+        env.pop("TEJAS_NO_BROWSER", None)
+# =============================================================================
     startup_log_path = os.path.join(BASE_DIR, "tejas.startup.log")
     try:
         # Keep import/bind failures diagnosable when Task Scheduler launches us
