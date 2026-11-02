@@ -341,7 +341,19 @@ class Config:
         return True, "enabled"
 
     # ── Trading Hours ─────────────────────────────────────────────────────────
-    EOD_EXECUTION_ONLY        = True
+    # =============================================================================
+    # [MODIFIED 2026-11-02]: Parameterize EOD_EXECUTION_ONLY with environment variable
+    # ORIGINAL INTENT: Hardcoded to True to restrict trading to the final 60 minutes of the session.
+    # REASON FOR CHANGE: Blocked intraday entries during regular market hours (e.g. 09:35 to 14:30 IST),
+    # preventing paper and live day trades from executing.
+    # SAFE ROLLBACK: Preserved original implementation below as comments.
+    # -----------------------------------------------------------------------------
+    # [PREVIOUS CODE - PRESERVED]:
+    # EOD_EXECUTION_ONLY        = True
+    # -----------------------------------------------------------------------------
+    # [NEW CODE]:
+    EOD_EXECUTION_ONLY        = os.getenv("EOD_EXECUTION_ONLY", "false").lower() == "true"
+    # =============================================================================
     EOD_EXECUTION_WINDOW_MINS = 60
     TRADE_AFTER_OPEN_MIN   = 20
     TRADE_BEFORE_CLOSE_MIN = 5

@@ -143,22 +143,50 @@ def set_paused(paused: bool) -> None:
         pass
 
 
+# =============================================================================
+# [MODIFIED 2026-11-02]: Explicit mode preservation (demo, paper, live) in autostart options
+# ORIGINAL INTENT: Saved broker and dry_run only, defaulting dry_run to True which forced
+# paper trading into observation-only dry_run mode.
+# REASON FOR CHANGE: Paper mode requires dry_run=False so SimulatedBroker actually fills orders
+# and enters positions. Explicitly persist mode and default to true paper trading.
+# SAFE ROLLBACK: Preserved original implementation below as comments.
+# -----------------------------------------------------------------------------
+# [PREVIOUS CODE - PRESERVED]:
+# def load_autostart_opts() -> dict:
+#     try:
+#         with open(AUTOSTART_PATH, encoding="utf-8") as f:
+#             return json.load(f)
+#     except Exception:
+#         return {"broker": "simulated", "dry_run": True, "bankroll": "100000", "scan": "30"}
+# def save_autostart_opts(opts: dict) -> None:
+#     keep = {k: opts.get(k) for k in ("broker", "dry_run", "ignore_hours", "bankroll", "scan")}
+#     try:
+#         with open(AUTOSTART_PATH, "w", encoding="utf-8") as f:
+#             json.dump(keep, f, indent=2)
+#     except OSError:
+#         pass
+# -----------------------------------------------------------------------------
+# [NEW CODE]:
 def load_autostart_opts() -> dict:
     """Last opts used from the UI, or paper-safe defaults if never started here."""
     try:
         with open(AUTOSTART_PATH, encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            if isinstance(data, dict):
+                return data
     except Exception:
-        return {"broker": "simulated", "dry_run": True, "bankroll": "100000", "scan": "30"}
+        pass
+    return {"mode": "paper", "broker": "simulated", "dry_run": False, "ignore_hours": False, "bankroll": "100000", "scan": "30"}
 
 
 def save_autostart_opts(opts: dict) -> None:
-    keep = {k: opts.get(k) for k in ("broker", "dry_run", "ignore_hours", "bankroll", "scan")}
+    keep = {k: opts.get(k) for k in ("mode", "broker", "dry_run", "ignore_hours", "bankroll", "scan")}
     try:
         with open(AUTOSTART_PATH, "w", encoding="utf-8") as f:
             json.dump(keep, f, indent=2)
     except OSError:
         pass
+# =============================================================================
 
 
 HEARTBEAT_PATH = os.path.join(BASE_DIR, "tejas.heartbeat")
@@ -320,12 +348,42 @@ def start_bot(opts: dict, source: str = "ui") -> dict:
             return value.strip().lower() in {"1", "true", "yes", "on"}
         return bool(value)
 
+    # =============================================================================
+    # [MODIFIED 2026-11-02]: Mode-driven execution flag resolution (Demo vs Paper vs Live)
+    # ORIGINAL INTENT: Read raw dry_run flag which was often true from defaults, disabling paper fills.
+    # REASON FOR CHANGE: When mode='paper', dry_run must be False to allow SimulatedBroker to fill
+    # orders and record them in the database. When mode='demo', dry_run is True (observation only).
+    # SAFE ROLLBACK: Preserved original implementation below as comments.
+    # -----------------------------------------------------------------------------
+    # [PREVIOUS CODE - PRESERVED]:
+    # broker = str(opts.get("broker", "simulated") or "simulated").strip().lower()
+    # if broker not in KEY_SPEC:
+    #     return {"ok": False, "error": f"unsupported broker: {broker}"}
+    # dry_run = _flag(opts.get("dry_run"))
+    # ignore_hours = _flag(opts.get("ignore_hours"))
+    # requested_live = broker != "simulated" and not dry_run
+    # -----------------------------------------------------------------------------
+    # [NEW CODE]:
+    mode_req = str(opts.get("mode") or "").strip().lower()
     broker = str(opts.get("broker", "simulated") or "simulated").strip().lower()
     if broker not in KEY_SPEC:
         return {"ok": False, "error": f"unsupported broker: {broker}"}
-    dry_run = _flag(opts.get("dry_run"))
-    ignore_hours = _flag(opts.get("ignore_hours"))
+    if mode_req == "demo":
+        dry_run = True
+        ignore_hours = True
+        broker = "simulated"
+    elif mode_req == "paper":
+        dry_run = False
+        ignore_hours = _flag(opts.get("ignore_hours", False))
+        broker = "simulated"
+    elif mode_req == "live":
+        dry_run = False
+        ignore_hours = False
+    else:
+        dry_run = _flag(opts.get("dry_run", False))
+        ignore_hours = _flag(opts.get("ignore_hours", False))
     requested_live = broker != "simulated" and not dry_run
+    # =============================================================================
 
     # A dashboard acknowledgement is one-shot and is deliberately never saved in
     # autostart.local.json. Persisted live-broker settings therefore cannot arm
@@ -449,6 +507,7 @@ def start_bot(opts: dict, source: str = "ui") -> dict:
         bot_cfg = {k: env[k] for k in
                    ("BROKER", "DRY_RUN", "IGNORE_MARKET_HOURS", "BANKROLL",
                     "ENABLE_LIVE_TRADING")}
+        bot_cfg["mode"] = mode_req
         if source == "ui":
             # Remember these for the auto-supervisor, and clear any manual pause.
             save_autostart_opts(opts)
@@ -1046,11 +1105,20 @@ def status() -> dict:
     close_mins = max(0.0, (15 * 60 + 30) - (now_ist.hour * 60 + now_ist.minute))
     
     running = is_running()
-    broker = str(bot_cfg.get("BROKER", "simulated")).lower()
-    dry_run = bool(bot_cfg.get("DRY_RUN", True))
-    ignore_hours = bool(bot_cfg.get("IGNORE_MARKET_HOURS", False))
+    active_opts = bot_cfg if running else load_autostart_opts()
+    saved_mode = str(active_opts.get("mode") or "").lower()
+    broker = str(active_opts.get("broker", active_opts.get("BROKER", "simulated"))).lower()
+    dry_run = bool(active_opts.get("dry_run", active_opts.get("DRY_RUN", False)))
+    ignore_hours = bool(active_opts.get("ignore_hours", active_opts.get("IGNORE_MARKET_HOURS", False)))
     
-    mode = "demo" if broker == "simulated" and dry_run else ("paper" if broker == "simulated" else "live")
+    if saved_mode in ("demo", "paper", "live"):
+        mode = saved_mode
+    elif broker != "simulated" and not dry_run:
+        mode = "live"
+    elif dry_run:
+        mode = "demo"
+    else:
+        mode = "paper"
     state = "running" if running else ("halted" if _system_health == "HALTED" else "stopped")
 
     positions = open_positions()
@@ -1391,6 +1459,8 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(status_code, json.dumps({"ok": False, "error": error}))
                 return
             opts = load_autostart_opts()
+            if "mode" in body:
+                opts["mode"] = str(body["mode"]).lower()
             if "bankroll" in body:
                 opts["bankroll"] = float(body["bankroll"])
             if "scan_interval" in body:
@@ -1399,6 +1469,19 @@ class Handler(BaseHTTPRequestHandler):
                 opts["broker"] = str(body["broker"]).lower()
             if "dry_run" in body:
                 opts["dry_run"] = bool(body["dry_run"])
+            if "ignore_hours" in body:
+                opts["ignore_hours"] = bool(body["ignore_hours"])
+            # Reconcile mode with broker and dry_run
+            m = opts.get("mode")
+            if m == "paper":
+                opts["broker"] = "simulated"
+                opts["dry_run"] = False
+            elif m == "demo":
+                opts["broker"] = "simulated"
+                opts["dry_run"] = True
+                opts["ignore_hours"] = True
+            elif m == "live":
+                opts["dry_run"] = False
             save_autostart_opts(opts)
             bot_cfg.update(opts)
             self._send(200, json.dumps({"ok": True, "config": opts}))
@@ -2537,10 +2620,12 @@ function handleStartStop() {
   } else {
     const mode = document.getElementById("modeSelect").value;
     const isLive = mode === "live";
+    const isDemo = mode === "demo";
     const opts = {
+      mode: mode,
       broker: isLive ? "zerodha" : "simulated",
-      dry_run: !isLive,
-      ignore_hours: mode === "demo"
+      dry_run: isDemo,
+      ignore_hours: isDemo
     };
     req("/api/start", "POST", opts).then(d => {
       if (d.ok) showToast("Engine started in " + mode.toUpperCase() + " mode");
@@ -2554,7 +2639,13 @@ function changeMode(mode) {
   if (mode === "live") {
     document.getElementById("liveModal").classList.add("show");
   } else {
-    req("/api/config", "POST", { broker: "simulated", dry_run: true }).then(() => {
+    const isDemo = mode === "demo";
+    req("/api/config", "POST", {
+      mode: mode,
+      broker: "simulated",
+      dry_run: isDemo,
+      ignore_hours: isDemo
+    }).then(() => {
       showToast("Mode switched to " + mode.toUpperCase());
       poll();
     });
