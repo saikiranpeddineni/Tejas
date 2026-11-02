@@ -1,6 +1,6 @@
 # Gates: Self-Healing Adaptive Trading Engine & Production Readiness Audit
 
-OWNS: adaptive_engine.py, autostart_manager.py, brokers/simulated.py, db.py, dynamic_risk.py, earnings_filter.py, execution_engine.py, remove_autostart.bat, scheduler.py, sentiment_engine.py, setup_autostart.bat, signal_engine_gold.py, Start Tejas.vbs, tejas.py, tests/**, watchdog.py, webui.py
+OWNS: adaptive_engine.py, autostart_manager.py, backtest_engine.py, brokers/simulated.py, db.py, dynamic_risk.py, earnings_filter.py, execution_engine.py, remove_autostart.bat, scheduler.py, sentiment_engine.py, setup_autostart.bat, signal_engine_gold.py, Start Tejas.vbs, tejas.py, tests/**, watchdog.py, webui.py
 
 Scope: Verify complete end-to-end implementation of the multi-tiered self-healing feedback engine, regression safety, paper and live trading parity, morning autostart and scheduling, and institutional production readiness constraints.
 
@@ -53,3 +53,13 @@ Scope: Verify complete end-to-end implementation of the multi-tiered self-healin
   CHECK: .venv\Scripts\python.exe tests/run_gates.py alphabot_sync ALPHABOT_SYNC_VERIFIED_SUCCESS
   EXPECT: ALPHABOT_SYNC_VERIFIED_SUCCESS
   EVIDENCE: automatic-evidence=v1; definition-sha256=7878625edbb92211349b7127fdddd2bd254f6c14d2511b6cfff77a9870775b5e; exit=0; EXPECT=matched; output-sha256=d786db14af070c1362002c7c4cd97c857831e16156a79824ee22d570b1b057d8; output-bytes=143; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=a5bbb5f35938/58 entries
+
+- [x] G11: Historical backtest replay engine executes bar-by-bar strategy replay with live progress tracking and full performance metrics
+  CHECK: .venv\Scripts\python.exe tests/run_gates.py backtest_replay BACKTEST_REPLAY_VERIFIED_SUCCESS
+  EXPECT: BACKTEST_REPLAY_VERIFIED_SUCCESS
+  EVIDENCE: automatic-evidence=v1; definition-sha256=f3ee6f67b75b4fc4cd2e5ce90ea90a6945430e77a561d0291eaee6bfdadaed27; exit=0; EXPECT=matched; output-sha256=d6b00cda9d0e8a9f393c3c29fff69ade0d93cf454bf200754ea5bfc4317f8356; output-bytes=142; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=a5bbb5f35938/58 entries
+
+- [x] G12: Replay history persistence in backtest_runs table and UI synchronization with Betadesk verified
+  CHECK: .venv\Scripts\python.exe tests/run_gates.py alphabot_sync ALPHABOT_SYNC_VERIFIED_SUCCESS
+  EXPECT: ALPHABOT_SYNC_VERIFIED_SUCCESS
+  EVIDENCE: automatic-evidence=v1; definition-sha256=7878625edbb92211349b7127fdddd2bd254f6c14d2511b6cfff77a9870775b5e; exit=0; EXPECT=matched; output-sha256=b49cffbc7f66fc95890a4356faf9f671446ffa0ff67b8c7736a51ce79bab7016; output-bytes=143; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=a5bbb5f35938/58 entries

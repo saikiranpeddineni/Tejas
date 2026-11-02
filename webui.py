@@ -31,6 +31,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import socket
+import db
 
 # NSE session calendar — single source of truth shared with the trading loop.
 from brokers.base import IST, SESSION_OPEN, SESSION_CLOSE, NSE_HOLIDAYS
@@ -1027,56 +1028,125 @@ def get_symbol_bars(symbol: str, timeframe: str = "5Min", limit: int = 100) -> l
             curr = c
     return bars
 
-def run_backtest_eval(lookback_days: int = 30, capital: float = 100000.0) -> dict:
+# =============================================================================
+# [MODIFIED 2026-11-02]: Backtest Replay Progress Tracking & Betadesk Engine Parity
+# ORIGINAL INTENT: run_backtest_eval merely queried closed trades in trades table,
+# which had 0.0 P&L from manual tests and returned flat 0% metrics without running replay.
+# REASON FOR CHANGE: User directive ("is run replay working? i dont see any progress
+# after hitting replay. Also make sure to add history to see old replay as same in betadesk").
+# Upgraded to run BacktestEngine, track live progress, and persist to backtest_runs.
+# SAFE ROLLBACK: Preserved original implementation below as comments.
+# -----------------------------------------------------------------------------
+# [PREVIOUS CODE - PRESERVED]:
+# def run_backtest_eval(lookback_days: int = 30, capital: float = 100000.0) -> dict:
+#     try:
+#         c = sqlite3.connect(DB_PATH, timeout=5)
+#         c.row_factory = sqlite3.Row
+#         rows = c.execute(
+#             "SELECT pnl_usd, pnl_pct, exit_time FROM trades WHERE status='closed' "
+#             "ORDER BY exit_time ASC"
+#         ).fetchall()
+#         c.close()
+#         pnls = [float(r["pnl_usd"] or 0.0) for r in rows]
+#         wins = [p for p in pnls if p > 0]
+#         losses = [p for p in pnls if p <= 0]
+#         n = len(pnls)
+#         total_pnl = sum(pnls)
+#         win_rate = (len(wins) / n * 100) if n else 65.0
+#         gross_win = sum(wins) if wins else 12500.0
+#         gross_loss = abs(sum(losses)) if losses else 4500.0
+#         profit_factor = round(gross_win / gross_loss, 2) if gross_loss > 0 else 2.5
+#         curve = [capital]
+#         current = capital
+#         for p in pnls:
+#             current += p
+#             curve.append(round(current, 2))
+#         if len(curve) == 1:
+#             for step in [0, 850, 1900, 1400, 3100, 4800, 4200, 6100, 7500, 9200]:
+#                 curve.append(capital + step)
+#         peak = curve[0]
+#         max_dd = 0.0
+#         for val in curve:
+#             if val > peak: peak = val
+#             dd_val = (peak - val) / peak * 100.0
+#             if dd_val > max_dd: max_dd = dd_val
+#         return {
+#             "ok": True,
+#             "metrics": {
+#                 "trades": max(n, 10),
+#                 "win_rate": round(win_rate, 1),
+#                 "profit_factor": profit_factor,
+#                 "total_pnl": round(total_pnl, 2),
+#                 "max_drawdown_pct": round(max_dd, 1),
+#                 "equity_curve": curve
+#             }
+#         }
+#     except Exception as e:
+#         return {"ok": False, "error": str(e)}
+# -----------------------------------------------------------------------------
+# [NEW CODE]:
+_backtest_progress: dict = {
+    "running": False,
+    "progress": 0.0,
+    "message": "Idle",
+    "run_id": None,
+    "result": None,
+    "error": None
+}
+
+
+def run_backtest_eval(
+    lookback_days: int = 7,
+    capital: float = 100000.0,
+    symbols: list | None = None,
+    use_ml_gate: bool = True
+) -> dict:
+    """Execute strategy historical backtest replay with live progress tracking and Betadesk parity."""
+    global _backtest_progress
+    _backtest_progress["running"] = True
+    _backtest_progress["progress"] = 0.05
+    _backtest_progress["message"] = "Initializing replay..."
+    _backtest_progress["error"] = None
+    _backtest_progress["result"] = None
+
+    def on_prog(frac: float, msg: str):
+        _backtest_progress["progress"] = round(frac, 3)
+        _backtest_progress["message"] = msg
+
     try:
-        c = sqlite3.connect(DB_PATH, timeout=5)
-        c.row_factory = sqlite3.Row
-        rows = c.execute(
-            "SELECT pnl_usd, pnl_pct, exit_time FROM trades WHERE status='closed' "
-            "ORDER BY exit_time ASC"
-        ).fetchall()
-        c.close()
-        pnls = [float(r["pnl_usd"] or 0.0) for r in rows]
-        wins = [p for p in pnls if p > 0]
-        losses = [p for p in pnls if p <= 0]
-        n = len(pnls)
-        total_pnl = sum(pnls)
-        win_rate = (len(wins) / n * 100) if n else 65.0
-        gross_win = sum(wins) if wins else 12500.0
-        gross_loss = abs(sum(losses)) if losses else 4500.0
-        profit_factor = round(gross_win / gross_loss, 2) if gross_loss > 0 else 2.5
+        from backtest_engine import BacktestEngine
+        target_syms = symbols if (symbols and len(symbols) > 0) else get_watchlist_symbols()[:10]
+        engine = BacktestEngine(symbols=target_syms)
+        res = engine.run(
+            symbols=target_syms,
+            days=lookback_days,
+            starting_cash=capital,
+            use_ml_gate=use_ml_gate,
+            on_progress=on_prog
+        )
         
-        # Cumulative equity curve
-        curve = [capital]
-        current = capital
-        for p in pnls:
-            current += p
-            curve.append(round(current, 2))
-        if len(curve) == 1:
-            # Baseline simulation curve
-            for step in [0, 850, 1900, 1400, 3100, 4800, 4200, 6100, 7500, 9200]:
-                curve.append(capital + step)
+        # Persist run into SQLite backtest_runs table
+        db.save_backtest(res["run_id"], res["summary"], res["payload"], res["created_at"])
 
-        peak = curve[0]
-        max_dd = 0.0
-        for val in curve:
-            if val > peak: peak = val
-            dd_val = (peak - val) / peak * 100.0
-            if dd_val > max_dd: max_dd = dd_val
+        _backtest_progress["running"] = False
+        _backtest_progress["progress"] = 1.0
+        _backtest_progress["message"] = "Replay complete"
+        _backtest_progress["run_id"] = res["run_id"]
+        _backtest_progress["result"] = res["payload"]
 
-        return {
-            "ok": True,
-            "metrics": {
-                "trades": max(n, 10),
-                "win_rate": round(win_rate, 1),
-                "profit_factor": profit_factor,
-                "total_pnl": round(total_pnl, 2),
-                "max_drawdown_pct": round(max_dd, 1),
-                "equity_curve": curve
-            }
-        }
+        # Return backward-compatible structure with full Betadesk payload
+        payload = res["payload"]
+        payload["ok"] = True
+        if "metrics" in payload and "equity_curve" in payload:
+            payload["metrics"]["equity_curve"] = payload["equity_curve"]
+        return payload
     except Exception as e:
+        _backtest_progress["running"] = False
+        _backtest_progress["progress"] = -1.0
+        _backtest_progress["message"] = f"Error: {e}"
+        _backtest_progress["error"] = str(e)
         return {"ok": False, "error": str(e)}
+# =============================================================================
 
 def status() -> dict:
     log = tail_log(150)
@@ -1411,6 +1481,17 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps(cand))
         elif path == "/api/history":
             self._send(200, json.dumps(trade_history()))
+        elif path == "/api/backtest/progress":
+            self._send(200, json.dumps(_backtest_progress))
+        elif path == "/api/backtests":
+            self._send(200, json.dumps(db.list_backtests()))
+        elif path.startswith("/api/backtests/"):
+            run_id = path.split("/api/backtests/")[1].strip()
+            res = db.get_backtest(run_id)
+            if res is None:
+                self._send(404, json.dumps({"ok": False, "error": "backtest not found"}))
+            else:
+                self._send(200, json.dumps(res))
         elif path == "/api/train":
             self._send(200, json.dumps({"running": train_state["running"],
                                         "msg": train_state["msg"], "info": model_info()}))
@@ -1524,12 +1605,39 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps({"symbols": symbols}))
             else:
                 self._send(400, json.dumps({"ok": False, "error": "symbols array required"}))
+        # =============================================================================
+        # [MODIFIED 2026-11-02]: Async Threaded Replay Execution with Immediate Progress Polling
+        # ORIGINAL INTENT: Ran run_backtest_eval synchronously, blocking HTTP response and UI.
+        # REASON FOR CHANGE: Enable real-time progress bar polling and background simulation.
+        # SAFE ROLLBACK: Preserved original implementation below as comments.
+        # -----------------------------------------------------------------------------
+        # [PREVIOUS CODE - PRESERVED]:
+        # elif path == "/api/backtest":
+        #     body, _, _ = _json_body(self)
+        #     days = int(body.get("lookback_days", 30) if body else 30)
+        #     cap = float(body.get("capital", 100000.0) if body else 100000.0)
+        #     res = run_backtest_eval(lookback_days=days, capital=cap)
+        #     self._send(200, json.dumps(res))
+        # -----------------------------------------------------------------------------
+        # [NEW CODE]:
         elif path == "/api/backtest":
             body, _, _ = _json_body(self)
-            days = int(body.get("lookback_days", 30) if body else 30)
-            cap = float(body.get("capital", 100000.0) if body else 100000.0)
-            res = run_backtest_eval(lookback_days=days, capital=cap)
-            self._send(200, json.dumps(res))
+            days = int(body.get("days", body.get("lookback_days", 7)) if body else 7)
+            cap = float(body.get("starting_cash", body.get("capital", 100000.0)) if body else 100000.0)
+            syms = body.get("symbols") if body else None
+            ml_gate = bool(body.get("use_ml_gate", True)) if body else True
+            sync_mode = bool(body.get("sync", False)) if body else False
+
+            if sync_mode:
+                res = run_backtest_eval(lookback_days=days, capital=cap, symbols=syms, use_ml_gate=ml_gate)
+                self._send(200, json.dumps(res))
+            else:
+                def _worker():
+                    run_backtest_eval(lookback_days=days, capital=cap, symbols=syms, use_ml_gate=ml_gate)
+                t = threading.Thread(target=_worker, daemon=True)
+                t.start()
+                self._send(200, json.dumps({"ok": True, "message": "Replay started"}))
+        # =============================================================================
         elif path == "/api/keys":
             body, status_code, error = _json_body(self)
             if error:
@@ -1748,6 +1856,21 @@ PAGE = r"""<!doctype html><html lang="en" data-theme="dark"><head><meta charset=
   .form-row label { display: block; font-size: 10px; font-weight: 700; color: var(--muted); margin-bottom: 4px; text-transform: uppercase; }
   .form-row input, .form-row select { width: 100%; }
 
+  /* Backtest Replay & History Tabs (Betadesk Parity) */
+  .bt-tabs { display: flex; gap: 16px; margin-bottom: 14px; border-bottom: 1px solid var(--border); }
+  .bt-tab { padding: 8px 4px; background: none; border: none; color: var(--muted); font-weight: 600; font-size: 12px; cursor: pointer; border-bottom: 2px solid transparent; transition: 0.15s; }
+  .bt-tab:hover { color: var(--fg); }
+  .bt-tab.active { color: var(--fg); font-weight: 800; border-bottom-color: var(--accent); }
+  .progress-bar { height: 6px; border-radius: 3px; background: var(--border); overflow: hidden; margin: 8px 0; }
+  .progress-bar .fill { height: 100%; background: var(--accent); width: 0%; transition: width 0.3s; }
+  .metric-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(115px, 1fr)); gap: 8px; margin: 12px 0; }
+  .metric-card { background: var(--card); border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; display: flex; flex-direction: column; }
+  .metric-card .k { font-size: 9px; text-transform: uppercase; letter-spacing: 0.5px; color: var(--muted); font-weight: 700; }
+  .metric-card .v { font-size: 14px; font-weight: 800; margin-top: 3px; }
+  .sym-chip { padding: 3px 8px; font-size: 10px; font-weight: 700; border-radius: 4px; border: 1px solid var(--border); background: var(--card); color: var(--muted); cursor: pointer; user-select: none; transition: 0.1s; }
+  .sym-chip:hover { border-color: var(--accent); color: var(--fg); }
+  .sym-chip.active { background: var(--soft); border-color: var(--accent); color: var(--accent); }
+
   /* Toast Notification */
   #toast { position: fixed; bottom: 20px; right: 20px; background: var(--card); color: var(--fg); border: 1px solid var(--accent); padding: 8px 14px; border-radius: 6px; font-weight: 600; font-size: 11px; z-index: 200; display: none; box-shadow: var(--shadow); }
 </style>
@@ -1893,7 +2016,15 @@ PAGE = r"""<!doctype html><html lang="en" data-theme="dark"><head><meta charset=
   </div>
 </div>
 
-<!-- Backtest Replay Modal -->
+<!-- =============================================================================
+<!-- [MODIFIED 2026-11-02]: Betadesk Parity Strategy Historical Backtest Replay Modal -->
+<!-- ORIGINAL INTENT: Simple 4-card modal with lookback days and capital only. -->
+<!-- REASON FOR CHANGE: User directive ("is run replay working? i dont see any progress -->
+<!-- after hitting replay. Also make sure to add history to see old replay as same in betadesk"). -->
+<!-- SAFE ROLLBACK: Preserved original modal HTML below as comments. -->
+<!-- ----------------------------------------------------------------------------- -->
+<!-- [PREVIOUS CODE - PRESERVED]: -->
+<!--
 <div id="btModal" class="overlay">
   <div class="modal" style="width:620px;">
     <div class="modal-head">
@@ -1931,6 +2062,146 @@ PAGE = r"""<!doctype html><html lang="en" data-theme="dark"><head><meta charset=
     </div>
   </div>
 </div>
+-->
+<!-- ----------------------------------------------------------------------------- -->
+<!-- [NEW CODE]: -->
+<div id="btModal" class="overlay">
+  <div class="modal" style="width:780px; max-width:96vw;">
+    <div class="modal-head">
+      <h3>Strategy Historical Backtest Replay</h3>
+      <button class="close-btn" onclick="closeModal('btModal')">×</button>
+    </div>
+
+    <!-- Tabs: New Run & History (Betadesk Synced) -->
+    <div class="bt-tabs">
+      <button id="btTabNewBtn" class="bt-tab active" onclick="switchBtTab('new')">New Run</button>
+      <button id="btTabHistoryBtn" class="bt-tab" onclick="switchBtTab('history')">History</button>
+    </div>
+
+    <!-- PANE 1: NEW RUN -->
+    <div id="btNewRunPane">
+      <!-- Symbols Selection -->
+      <div style="margin-bottom:12px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+          <label style="font-size:10px; font-weight:700; color:var(--muted); text-transform:uppercase;">
+            Replay Symbols (<span id="btSelectedSymCount">0</span> selected)
+          </label>
+          <div style="display:flex; gap:6px;">
+            <button type="button" class="btn ghost sm" onclick="btSelectAllSyms()">Select all</button>
+            <button type="button" class="btn ghost sm" onclick="btClearAllSyms()">Clear all</button>
+          </div>
+        </div>
+        <div id="btSymbolsList" style="display:flex; flex-wrap:wrap; gap:6px; max-height:85px; overflow-y:auto; padding:6px; border:1px solid var(--border); border-radius:6px; background:var(--card); margin-bottom:6px;"></div>
+        <div style="display:flex; gap:6px;">
+          <input id="btAddSymInput" type="text" placeholder="Add custom symbol (e.g. WIPRO, MARUTI)..." style="flex:1;" onkeydown="if(event.key==='Enter'){btAddCustomSym();}">
+          <button type="button" class="btn ghost sm" onclick="btAddCustomSym()">+ Add</button>
+        </div>
+      </div>
+
+      <!-- Config Grid -->
+      <div style="display:grid; grid-template-columns:1fr 1fr 1fr auto; gap:10px; margin-bottom:12px; align-items:flex-end;">
+        <div class="form-row" style="margin:0;">
+          <label>Lookback Days</label>
+          <select id="btDays">
+            <option value="5">5 Days</option>
+            <option value="7" selected>7 Days</option>
+            <option value="14">14 Days</option>
+            <option value="30">30 Days</option>
+            <option value="60">60 Days</option>
+            <option value="90">90 Days</option>
+          </select>
+        </div>
+        <div class="form-row" style="margin:0;">
+          <label>Initial Capital ₹</label>
+          <input id="btCap" type="number" value="100000" step="5000">
+        </div>
+        <div class="form-row" style="margin:0;">
+          <label>AI Signal Gate</label>
+          <button id="btMlGateBtn" type="button" class="btn ghost sm" style="width:100%; height:28px; justify-content:center;" onclick="toggleBtMlGate()">
+            <span id="btMlGateDot" style="color:var(--green); font-size:10px;">●</span> <span id="btMlGateText">ML Gate ON</span>
+          </button>
+        </div>
+        <button id="btRunBtn" class="btn primary" style="height:28px;" onclick="runBacktest()">Run Replay</button>
+      </div>
+
+      <!-- Live Replay Progress Bar -->
+      <div id="btProgressWrap" style="display:none; margin:12px 0; padding:10px; background:var(--card); border:1px solid var(--border); border-radius:6px;">
+        <div style="display:flex; justify-content:space-between; font-size:11px; font-weight:700; margin-bottom:4px;">
+          <span id="btProgressMsg">Replaying bars through the live engine stack…</span>
+          <span id="btProgressPct" class="num" style="color:var(--accent);">0%</span>
+        </div>
+        <div class="progress-bar" style="margin:4px 0 0 0;">
+          <div id="btProgressFill" class="fill" style="width:0%;"></div>
+        </div>
+      </div>
+
+      <!-- Results View -->
+      <div id="btResults" style="display:none; margin-top:14px;">
+        <!-- 10-Card Institutional Metrics Grid -->
+        <div class="metric-grid">
+          <div class="metric-card"><span class="k">Total Return</span><span id="btTotalReturn" class="v num pos">+0.00%</span></div>
+          <div class="metric-card"><span class="k">Max Drawdown</span><span id="btMaxDd" class="v num neg">0.00%</span></div>
+          <div class="metric-card"><span class="k">Sharpe</span><span id="btSharpe" class="v num">0.00</span></div>
+          <div class="metric-card"><span class="k">Sortino</span><span id="btSortino" class="v num">0.00</span></div>
+          <div class="metric-card"><span class="k">Win Rate</span><span id="btWr" class="v num pos">0.0%</span></div>
+          <div class="metric-card"><span class="k">Profit Factor</span><span id="btPf" class="v num">0.00</span></div>
+          <div class="metric-card"><span class="k">Trades</span><span id="btTradesCount" class="v num">0</span></div>
+          <div class="metric-card"><span class="k">Expectancy</span><span id="btExpectancy" class="v num">₹0</span></div>
+          <div class="metric-card"><span class="k">Avg R</span><span id="btAvgR" class="v num">0.00R</span></div>
+          <div class="metric-card"><span class="k">Final Equity</span><span id="btFinalEquity" class="v num">₹1,00,000</span></div>
+        </div>
+
+        <!-- Cumulative Equity Curve Canvas -->
+        <div style="background:var(--card); border-radius:6px; padding:8px; border:1px solid var(--border); margin-bottom:12px;">
+          <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+            <span style="font-size:10px; font-weight:700; color:var(--muted); text-transform:uppercase;">Cumulative Equity Curve (₹)</span>
+            <span id="btCurvePointsCount" class="muted" style="font-size:10px;"></span>
+          </div>
+          <canvas id="btCanvas" style="width:100%; height:160px; display:block;"></canvas>
+        </div>
+
+        <!-- Simulated Closed Trades Table -->
+        <div style="border:1px solid var(--border); border-radius:6px; overflow:hidden; max-height:220px; overflow-y:auto;">
+          <table class="data-table" style="width:100%;">
+            <thead>
+              <tr>
+                <th>Entry Time</th><th>Exit Time</th><th>Symbol</th><th>Side</th><th class="num">Qty</th>
+                <th class="num">Entry</th><th class="num">Exit</th><th class="num">P&L (₹)</th><th class="num">R</th><th>Strategy</th><th>Exit</th>
+              </tr>
+            </thead>
+            <tbody id="btTradesTableBody"></tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- PANE 2: HISTORY (Betadesk Synced) -->
+    <div id="btHistoryPane" style="display:none;">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+        <span class="muted" style="font-size:11px;">Saved strategy historical backtest replays</span>
+        <button class="btn ghost sm" onclick="fetchBacktestHistory()">↻ Refresh</button>
+      </div>
+      <div style="border:1px solid var(--border); border-radius:6px; overflow:hidden; max-height:380px; overflow-y:auto;">
+        <table class="data-table" style="width:100%;">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Suite / Symbols</th>
+              <th class="num">Days</th>
+              <th class="num">Return</th>
+              <th class="num">Max DD</th>
+              <th class="num">Trades</th>
+              <th class="num">Win Rate</th>
+              <th style="text-align:center;">Action</th>
+            </tr>
+          </thead>
+          <tbody id="btHistoryBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+<!-- ============================================================================= -->
 
 <!-- Settings Modal -->
 <div id="setModal" class="overlay">
@@ -2756,32 +3027,336 @@ function resetCooldowns() {
   }
 }
 
+// =============================================================================
+// [MODIFIED 2026-11-02]: Betadesk Parity Replay Handlers, Live Progress Polling & History
+// ORIGINAL INTENT: runBacktest only executed a static request and populated 4 metrics.
+// REASON FOR CHANGE: User directive ("is run replay working? i dont see any progress
+// after hitting replay. Also make sure to add history to see old replay as same in betadesk").
+// SAFE ROLLBACK: Preserved original implementation below as comments.
+// -----------------------------------------------------------------------------
+// [PREVIOUS CODE - PRESERVED]:
+// function openBacktestModal() {
+//   document.getElementById("btModal").classList.add("show");
+// }
+// function runBacktest() {
+//   const days = parseInt(document.getElementById("btDays").value) || 30;
+//   const cap = parseFloat(document.getElementById("btCap").value) || 100000;
+//   const btn = document.getElementById("btRunBtn");
+//   btn.innerText = "Replaying...";
+//   req("/api/backtest", "POST", { lookback_days: days, capital: cap }).then(d => {
+//     btn.innerText = "Run Replay";
+//     if (d.ok && d.metrics) {
+//       const m = d.metrics;
+//       document.getElementById("btWr").innerText = m.win_rate + "%";
+//       document.getElementById("btPf").innerText = m.profit_factor;
+//       document.getElementById("btPnl").innerText = "₹" + m.total_pnl.toLocaleString('en-IN');
+//       document.getElementById("btDd").innerText = m.max_drawdown_pct + "%";
+//       document.getElementById("btResults").style.display = "block";
+//       drawBacktestChart(m.equity_curve || []);
+//     }
+//   });
+// }
+// -----------------------------------------------------------------------------
+// [NEW CODE]:
+let btSymbols = ["TATAMOTORS", "RELIANCE", "INFY", "TCS", "HDFCBANK", "ICICIBANK", "SBIN"];
+let btAllSymbols = [];
+let btMlGate = true;
+let btPollTimer = null;
+
 function openBacktestModal() {
   document.getElementById("btModal").classList.add("show");
-}
-
-function runBacktest() {
-  const days = parseInt(document.getElementById("btDays").value) || 30;
-  const cap = parseFloat(document.getElementById("btCap").value) || 100000;
-  const btn = document.getElementById("btRunBtn");
-  btn.innerText = "Replaying...";
-  req("/api/backtest", "POST", { lookback_days: days, capital: cap }).then(d => {
-    btn.innerText = "Run Replay";
-    if (d.ok && d.metrics) {
-      const m = d.metrics;
-      document.getElementById("btWr").innerText = m.win_rate + "%";
-      document.getElementById("btPf").innerText = m.profit_factor;
-      document.getElementById("btPnl").innerText = "₹" + m.total_pnl.toLocaleString('en-IN');
-      document.getElementById("btDd").innerText = m.max_drawdown_pct + "%";
-      document.getElementById("btResults").style.display = "block";
-      drawBacktestChart(m.equity_curve || []);
+  req("/api/watchlist").then(d => {
+    if (d && d.symbols && d.symbols.length > 0) {
+      btAllSymbols = Array.from(new Set([...d.symbols, ...btSymbols]));
+    } else {
+      btAllSymbols = [...btSymbols];
     }
+    renderBtSymbols();
   });
 }
 
+function switchBtTab(tab) {
+  const newPane = document.getElementById("btNewRunPane");
+  const histPane = document.getElementById("btHistoryPane");
+  const tabNewBtn = document.getElementById("btTabNewBtn");
+  const tabHistBtn = document.getElementById("btTabHistoryBtn");
+
+  if (tab === "new") {
+    newPane.style.display = "block";
+    histPane.style.display = "none";
+    tabNewBtn.classList.add("active");
+    tabHistBtn.classList.remove("active");
+  } else {
+    newPane.style.display = "none";
+    histPane.style.display = "block";
+    tabNewBtn.classList.remove("active");
+    tabHistBtn.classList.add("active");
+    fetchBacktestHistory();
+  }
+}
+
+function renderBtSymbols() {
+  const container = document.getElementById("btSymbolsList");
+  if (!container) return;
+  const countEl = document.getElementById("btSelectedSymCount");
+  if (countEl) countEl.innerText = btSymbols.length;
+
+  container.innerHTML = btAllSymbols.map(sym => {
+    const isSel = btSymbols.includes(sym);
+    return `<span class="sym-chip ${isSel ? 'active' : ''}" onclick="toggleBtSymbol('${sym}')">${sym}</span>`;
+  }).join("");
+}
+
+function toggleBtSymbol(sym) {
+  if (btSymbols.includes(sym)) {
+    btSymbols = btSymbols.filter(s => s !== sym);
+  } else {
+    btSymbols.push(sym);
+  }
+  renderBtSymbols();
+}
+
+function btSelectAllSyms() {
+  btSymbols = [...btAllSymbols];
+  renderBtSymbols();
+}
+
+function btClearAllSyms() {
+  btSymbols = [];
+  renderBtSymbols();
+}
+
+function btAddCustomSym() {
+  const input = document.getElementById("btAddSymInput");
+  const val = input.value.trim().toUpperCase();
+  if (val) {
+    const syms = val.split(",").map(s => s.trim().toUpperCase()).filter(s => s);
+    syms.forEach(s => {
+      if (!btAllSymbols.includes(s)) btAllSymbols.push(s);
+      if (!btSymbols.includes(s)) btSymbols.push(s);
+    });
+    input.value = "";
+    renderBtSymbols();
+  }
+}
+
+function toggleBtMlGate() {
+  btMlGate = !btMlGate;
+  const dot = document.getElementById("btMlGateDot");
+  const text = document.getElementById("btMlGateText");
+  if (btMlGate) {
+    dot.style.color = "var(--green)";
+    text.innerText = "ML Gate ON";
+  } else {
+    dot.style.color = "var(--muted)";
+    text.innerText = "Raw Signals";
+  }
+}
+
+function runBacktest() {
+  if (btSymbols.length === 0) {
+    alert("Please select at least one symbol for replay");
+    return;
+  }
+  const days = parseInt(document.getElementById("btDays").value) || 7;
+  const cap = parseFloat(document.getElementById("btCap").value) || 100000;
+  const btn = document.getElementById("btRunBtn");
+  const progWrap = document.getElementById("btProgressWrap");
+  const progFill = document.getElementById("btProgressFill");
+  const progMsg = document.getElementById("btProgressMsg");
+  const progPct = document.getElementById("btProgressPct");
+
+  btn.disabled = true;
+  btn.innerText = "Replaying…";
+  progWrap.style.display = "block";
+  progFill.style.width = "5%";
+  progPct.innerText = "5%";
+  progMsg.innerText = "Initializing replay engine stack…";
+
+  if (btPollTimer) clearInterval(btPollTimer);
+
+  // Poll progress state every 200ms
+  btPollTimer = setInterval(() => {
+    req("/api/backtest/progress").then(p => {
+      if (!p) return;
+      const pct = Math.max(5, Math.min(100, Math.round((p.progress || 0) * 100)));
+      progFill.style.width = pct + "%";
+      progPct.innerText = pct + "%";
+      if (p.message) progMsg.innerText = p.message;
+
+      if (!p.running && (p.progress >= 1.0 || p.result || p.error)) {
+        clearInterval(btPollTimer);
+        btPollTimer = null;
+        btn.disabled = false;
+        btn.innerText = "Run Replay";
+        if (p.error) {
+          alert("Replay failed: " + p.error);
+        } else if (p.result) {
+          displayBacktestResult(p.result);
+          showToast("Replay complete!");
+        }
+      }
+    });
+  }, 200);
+
+  // Trigger backtest execution
+  req("/api/backtest", "POST", {
+    days: days,
+    capital: cap,
+    symbols: btSymbols,
+    use_ml_gate: btMlGate
+  }).then(d => {
+    if (d && d.metrics) {
+      // Synchronous return path
+      if (btPollTimer) { clearInterval(btPollTimer); btPollTimer = null; }
+      progFill.style.width = "100%";
+      progPct.innerText = "100%";
+      btn.disabled = false;
+      btn.innerText = "Run Replay";
+      displayBacktestResult(d);
+      showToast("Replay complete!");
+    }
+  }).catch(e => {
+    if (btPollTimer) { clearInterval(btPollTimer); btPollTimer = null; }
+    btn.disabled = false;
+    btn.innerText = "Run Replay";
+    alert("Replay request error: " + e);
+  });
+}
+
+function displayBacktestResult(data) {
+  const m = data.metrics || data;
+  if (!m) return;
+
+  // 10 Metric Cards (Betadesk Parity)
+  const retEl = document.getElementById("btTotalReturn");
+  const retVal = m.total_return_pct ?? 0.0;
+  retEl.innerText = (retVal >= 0 ? "+" : "") + retVal.toFixed(2) + "%";
+  retEl.className = "v num " + (retVal >= 0 ? "pos" : "neg");
+
+  document.getElementById("btMaxDd").innerText = (m.max_drawdown_pct ?? 0.0).toFixed(2) + "%";
+  document.getElementById("btSharpe").innerText = m.sharpe != null ? m.sharpe.toFixed(2) : "—";
+  document.getElementById("btSortino").innerText = m.sortino != null ? m.sortino.toFixed(2) : "—";
+  
+  const wrEl = document.getElementById("btWr");
+  wrEl.innerText = (m.win_rate ?? 0.0).toFixed(1) + "%";
+  wrEl.className = "v num " + ((m.win_rate ?? 0) >= 50 ? "pos" : "");
+
+  document.getElementById("btPf").innerText = m.profit_factor != null ? m.profit_factor.toFixed(2) : "—";
+  document.getElementById("btTradesCount").innerText = m.total_trades ?? 0;
+  
+  const expEl = document.getElementById("btExpectancy");
+  const expVal = m.expectancy ?? 0.0;
+  expEl.innerText = (expVal >= 0 ? "+₹" : "-₹") + Math.abs(expVal).toFixed(2);
+  expEl.className = "v num " + (expVal >= 0 ? "pos" : "neg");
+
+  document.getElementById("btAvgR").innerText = (m.avg_r != null ? m.avg_r.toFixed(2) : "0.00") + "R";
+  document.getElementById("btFinalEquity").innerText = "₹" + Math.round(m.final_equity || 100000).toLocaleString('en-IN');
+
+  // Curve points count indicator
+  const curve = data.equity_curve || m.equity_curve || [];
+  const ptCountEl = document.getElementById("btCurvePointsCount");
+  if (ptCountEl) ptCountEl.innerText = `${curve.length} session ticks`;
+
+  document.getElementById("btResults").style.display = "block";
+  drawBacktestChart(curve);
+
+  // Render Trades Table (Betadesk Parity)
+  const tbody = document.getElementById("btTradesTableBody");
+  if (tbody) {
+    const trades = data.trades || [];
+    if (trades.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="11" class="muted" style="text-align:center; padding:12px;">No simulated trades in this run</td></tr>`;
+    } else {
+      tbody.innerHTML = trades.map(t => {
+        const pnlCls = t.pnl >= 0 ? "pos" : "neg";
+        const pnlStr = (t.pnl >= 0 ? "+" : "") + Number(t.pnl).toFixed(2);
+        const rStr = t.r_multiple != null ? Number(t.r_multiple).toFixed(1) + "R" : "—";
+        const entryStr = t.entry_at ? t.entry_at.replace("T", " ").slice(5, 16) : "—";
+        const exitStr = t.exit_at ? t.exit_at.replace("T", " ").slice(5, 16) : "—";
+        return `
+          <tr>
+            <td class="faint num" style="white-space:nowrap;">${entryStr}</td>
+            <td class="faint num" style="white-space:nowrap;">${exitStr}</td>
+            <td><b>${t.symbol}</b></td>
+            <td><span class="side-tag ${t.side}">${t.side}</span></td>
+            <td class="num">${t.qty}</td>
+            <td class="num">${Number(t.entry_price).toFixed(2)}</td>
+            <td class="num">${Number(t.exit_price).toFixed(2)}</td>
+            <td class="num ${pnlCls}"><b>${pnlStr}</b></td>
+            <td class="num">${rStr}</td>
+            <td class="muted">${t.strategy || "orb"}</td>
+            <td class="muted">${t.exit_reason || "target"}</td>
+          </tr>
+        `;
+      }).join("");
+    }
+  }
+
+  // Scroll results smoothly into view
+  document.getElementById("btResults").scrollIntoView({ behavior: "smooth" });
+}
+
+function fetchBacktestHistory() {
+  const tbody = document.getElementById("btHistoryBody");
+  if (!tbody) return;
+  tbody.innerHTML = `<tr><td colspan="8" class="muted" style="text-align:center; padding:12px;">Loading replay history…</td></tr>`;
+
+  req("/api/backtests").then(list => {
+    if (!list || list.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="8" class="muted" style="text-align:center; padding:12px;">No historical backtest replays found. Run a replay to save history.</td></tr>`;
+      return;
+    }
+    tbody.innerHTML = list.map(h => {
+      const timeStr = h.created_at ? h.created_at.replace("T", " ").slice(0, 16) : "—";
+      const syms = Array.isArray(h.symbols) ? h.symbols.join(", ") : (h.symbols || "—");
+      const title = h.suite_name ? `<b>${h.suite_name}</b><br><span class="faint" style="font-size:9px;">${syms}</span>` : syms;
+      const retCls = (h.total_return_pct ?? 0) >= 0 ? "pos" : "neg";
+      const retStr = (h.total_return_pct != null ? (h.total_return_pct >= 0 ? "+" : "") + h.total_return_pct.toFixed(2) + "%" : "—");
+      const ddStr = h.max_drawdown_pct != null ? h.max_drawdown_pct.toFixed(2) + "%" : "—";
+      const wrStr = h.win_rate != null ? h.win_rate.toFixed(1) + "%" : "—";
+
+      return `
+        <tr>
+          <td class="faint num" style="white-space:nowrap;">${timeStr}</td>
+          <td style="max-width:240px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;" title="${syms}">${title}</td>
+          <td class="num">${h.days ?? "—"}</td>
+          <td class="num ${retCls}"><b>${retStr}</b></td>
+          <td class="num neg">${ddStr}</td>
+          <td class="num">${h.total_trades ?? 0}</td>
+          <td class="num pos">${wrStr}</td>
+          <td style="text-align:center;">
+            <button class="btn ghost sm" onclick="loadBacktestRun('${h.id}')">View</button>
+          </td>
+        </tr>
+      `;
+    }).join("");
+  }).catch(e => {
+    tbody.innerHTML = `<tr><td colspan="8" class="muted" style="text-align:center; padding:12px;">Error loading history: ${e}</td></tr>`;
+  });
+}
+
+function loadBacktestRun(runId) {
+  showToast("Loading replay run…");
+  req("/api/backtests/" + runId).then(data => {
+    if (!data) {
+      alert("Could not load backtest run");
+      return;
+    }
+    switchBtTab("new");
+    displayBacktestResult(data);
+    showToast("Loaded replay: " + (data.id || runId).slice(0, 8));
+  }).catch(e => {
+    alert("Failed to load backtest: " + e);
+  });
+}
+// =============================================================================
+
 function drawBacktestChart(curve) {
   const canvas = document.getElementById("btCanvas");
-  if (!canvas || !curve.length) return;
+  if (!canvas || !curve || !curve.length) return;
+  const rawVals = curve.map(pt => (typeof pt === "number" ? pt : (pt && pt.v != null ? Number(pt.v) : (Array.isArray(pt) ? Number(pt[1]) : 0))));
+  if (!rawVals.length) return;
   canvas.width = canvas.parentElement.clientWidth * window.devicePixelRatio;
   canvas.height = 160 * window.devicePixelRatio;
   const ctx = canvas.getContext("2d");
@@ -2791,8 +3366,9 @@ function drawBacktestChart(curve) {
   const h = 160;
   ctx.clearRect(0, 0, w, h);
   
-  let min = Math.min(...curve);
-  let max = Math.max(...curve);
+  let min = Math.min(...rawVals);
+  let max = Math.max(...rawVals);
+  if (min === max) { min -= 1000; max += 1000; }
   const pad = (max - min) * 0.1 || 1000;
   min -= pad; max += pad;
   
@@ -2802,8 +3378,8 @@ function drawBacktestChart(curve) {
   grad.addColorStop(1, "rgba(59,130,246,0.0)");
   
   ctx.beginPath();
-  curve.forEach((val, i) => {
-    const x = (i / (curve.length - 1)) * w;
+  rawVals.forEach((val, i) => {
+    const x = rawVals.length > 1 ? (i / (rawVals.length - 1)) * w : 0;
     const y = h - ((val - min) / (max - min) * (h - 20)) - 10;
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);
@@ -2818,8 +3394,8 @@ function drawBacktestChart(curve) {
   ctx.beginPath();
   ctx.strokeStyle = "var(--accent)";
   ctx.lineWidth = 2;
-  curve.forEach((val, i) => {
-    const x = (i / (curve.length - 1)) * w;
+  rawVals.forEach((val, i) => {
+    const x = rawVals.length > 1 ? (i / (rawVals.length - 1)) * w : 0;
     const y = h - ((val - min) / (max - min) * (h - 20)) - 10;
     if (i === 0) ctx.moveTo(x, y);
     else ctx.lineTo(x, y);

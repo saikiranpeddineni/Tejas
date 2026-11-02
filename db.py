@@ -153,6 +153,22 @@ CREATE TABLE IF NOT EXISTS trade_postmortems (
 CREATE INDEX IF NOT EXISTS idx_pm_symbol ON trade_postmortems (symbol);
 CREATE INDEX IF NOT EXISTS idx_pm_exit   ON trade_postmortems (exit_time DESC);
 CREATE INDEX IF NOT EXISTS idx_pm_cat    ON trade_postmortems (failure_category);
+
+-- =============================================================================
+-- [MODIFIED 2026-11-02]: Add backtest_runs table for Replay History & Betadesk Parity
+-- ORIGINAL INTENT: Replay was ad-hoc and not persisted in SQLite.
+-- REASON FOR CHANGE: Betadesk parity requires persistent storage of backtest runs,
+-- summaries for fast history list view, and full payloads for detailed inspection.
+-- SAFE ROLLBACK: Preserved original schema ending below.
+-- -----------------------------------------------------------------------------
+-- [NEW CODE]:
+CREATE TABLE IF NOT EXISTS backtest_runs (
+    id          TEXT PRIMARY KEY,
+    created_at  TEXT NOT NULL DEFAULT (datetime('now','utc')),
+    summary     TEXT NOT NULL,
+    payload     TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bt_created ON backtest_runs (created_at DESC);
 -- =============================================================================
 """
 
@@ -199,6 +215,9 @@ def init_db() -> None:
         log.info(f"✓ DB ready: {Config.DB_PATH}")
     finally:
         conn.close()
+    
+    # Pre-seed standard benchmark backtest suites if table is empty
+    seed_benchmark_backtests_if_empty()
 
 
 def _make_conn() -> sqlite3.Connection:
@@ -254,3 +273,95 @@ def executemany(sql: str, params_list) -> int:
     except Exception:
         conn.rollback()
         raise
+
+
+# =============================================================================
+# [MODIFIED 2026-11-02]: Add Backtest & Replay Persistence Functions for Betadesk Parity
+# ORIGINAL INTENT: No database helpers existed for saving/listing/fetching backtests.
+# REASON FOR CHANGE: Enable Betadesk-identical History tab and replay run persistence.
+# SAFE ROLLBACK: Additive methods.
+# -----------------------------------------------------------------------------
+# [NEW CODE]:
+import json
+from datetime import datetime, timezone
+
+
+def save_backtest(run_id: str, summary: dict, payload: dict, created_at: str | None = None) -> None:
+    """Save or update a backtest replay run in backtest_runs table."""
+    if created_at is None:
+        created_at = datetime.now(timezone.utc).isoformat()
+    execute(
+        "INSERT OR REPLACE INTO backtest_runs (id, created_at, summary, payload) VALUES (?, ?, ?, ?)",
+        (run_id, created_at, json.dumps(summary), json.dumps(payload)),
+    )
+
+
+def list_backtests(limit: int = 50) -> list[dict]:
+    """List recent backtest run summaries for the History table."""
+    rows = fetchall("SELECT id, created_at, summary FROM backtest_runs ORDER BY created_at DESC LIMIT ?", (limit,))
+    results = []
+    for r in rows:
+        try:
+            s = json.loads(r["summary"])
+            s["id"] = r["id"]
+            s["created_at"] = r["created_at"]
+            results.append(s)
+        except Exception:
+            continue
+    return results
+
+
+def get_backtest(run_id: str) -> dict | None:
+    """Fetch complete backtest payload by run_id."""
+    row = fetchone("SELECT payload FROM backtest_runs WHERE id = ?", (run_id,))
+    if not row:
+        return None
+    try:
+        return json.loads(row["payload"])
+    except Exception:
+        return None
+
+
+def seed_benchmark_backtests_if_empty() -> None:
+    """Seed standard historical backtests matching Betadesk so History tab is populated on launch."""
+    try:
+        row = fetchone("SELECT count(*) as cnt FROM backtest_runs")
+        if row and row["cnt"] > 0:
+            return
+        
+        from backtest_engine import BacktestEngine
+        engine = BacktestEngine()
+        
+        # 1. Test 3 Benchmark: 11 symbols, 5 days
+        res1 = engine.run(
+            symbols=["TATAMOTORS", "RELIANCE", "INFY", "TCS", "HDFCBANK", "ICICIBANK", "SBIN", "BHARTIARTL", "LT", "ITC", "AXISBANK"],
+            days=5,
+            starting_cash=100000.0,
+            use_ml_gate=True
+        )
+        res1["summary"]["suite_name"] = "Peak 5-Day Benchmark (11 Symbols)"
+        save_backtest(res1["run_id"], res1["summary"], res1["payload"], res1["created_at"])
+
+        # 2. Test 2 Benchmark: 14 days
+        res2 = engine.run(
+            symbols=["TATAMOTORS", "RELIANCE", "INFY", "TCS", "HDFCBANK", "ICICIBANK", "SBIN"],
+            days=14,
+            starting_cash=100000.0,
+            use_ml_gate=True
+        )
+        res2["summary"]["suite_name"] = "Standard 14-Day Replay (7 Core Symbols)"
+        save_backtest(res2["run_id"], res2["summary"], res2["payload"], res2["created_at"])
+
+        # 3. Test 1 Benchmark: 30 days
+        res3 = engine.run(
+            symbols=["TATAMOTORS", "RELIANCE", "INFY", "TCS", "HDFCBANK"],
+            days=30,
+            starting_cash=100000.0,
+            use_ml_gate=True
+        )
+        res3["summary"]["suite_name"] = "Monthly Strategy Evaluation (30 Days)"
+        save_backtest(res3["run_id"], res3["summary"], res3["payload"], res3["created_at"])
+    except Exception as e:
+        log.warning(f"Could not seed benchmark backtests: {e}")
+# =============================================================================
+
