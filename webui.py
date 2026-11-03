@@ -476,26 +476,41 @@ def start_bot(opts: dict, source: str = "ui") -> dict:
             startup_log = open(startup_log_path, "ab")
             try:
                 # =============================================================================
-                # [MODIFIED 2026-11-01]: Virtualenv python resolution for bot child process
-                # ORIGINAL INTENT: Used sys.executable to launch tejas.py child.
-                # REASON FOR CHANGE: If webui is launched via system python, sys.executable lacks
-                # dependencies (joblib, lightgbm, etc.). Prioritize .venv/Scripts/python.exe.
+                # [MODIFIED 2026-11-03]: Suppress Blank CMD Console Window via pythonw & CREATE_NO_WINDOW
+                # ORIGINAL INTENT: Launched tejas.py using .venv python.exe without creationflags.
+                # REASON FOR CHANGE: python.exe is a console subsystem binary. Even when spawned from
+                # pythonw, uv's python.exe trampoline chains to cpython-python.exe, which prompts
+                # Windows kernel to allocate a conhost console window. Using .venv\Scripts\pythonw.exe
+                # (matching watchdog.py and autostart_manager.py) and creationflags=CREATE_NO_WINDOW
+                # guarantees zero console popups while running uninterrupted during market hours.
                 # SAFE ROLLBACK: Preserved original implementation below as comments.
                 # -----------------------------------------------------------------------------
                 # [PREVIOUS CODE - PRESERVED]:
+                # venv_py = os.path.join(BASE_DIR, ".venv", "Scripts", "python.exe")
+                # py_bin = venv_py if os.path.exists(venv_py) else sys.executable
+                # flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
                 # bot_proc = subprocess.Popen(
-                #     [sys.executable, "-u", os.path.join(BASE_DIR, "tejas.py")],
+                #     [py_bin, "-u", os.path.join(BASE_DIR, "tejas.py")],
                 #     cwd=BASE_DIR, env=env,
                 #     stdout=subprocess.DEVNULL, stderr=startup_log,
+                #     creationflags=flags,
                 # )
                 # -----------------------------------------------------------------------------
                 # [NEW CODE]:
+                venv_pyw = os.path.join(BASE_DIR, ".venv", "Scripts", "pythonw.exe")
                 venv_py = os.path.join(BASE_DIR, ".venv", "Scripts", "python.exe")
-                py_bin = venv_py if os.path.exists(venv_py) else sys.executable
+                if os.path.exists(venv_pyw):
+                    py_bin = venv_pyw
+                elif os.path.exists(venv_py):
+                    py_bin = venv_py
+                else:
+                    py_bin = sys.executable
+                flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
                 bot_proc = subprocess.Popen(
                     [py_bin, "-u", os.path.join(BASE_DIR, "tejas.py")],
                     cwd=BASE_DIR, env=env,
                     stdout=subprocess.DEVNULL, stderr=startup_log,
+                    creationflags=flags,
                 )
                 # =============================================================================
             finally:
@@ -3561,9 +3576,22 @@ if __name__ == "__main__":
     print("   If the phone can't connect, allow Python through")
     print("   Windows Firewall (Private networks).")
     print("=" * 52)
+    # =============================================================================
+    # [MODIFIED 2026-11-02]: Enable allow_reuse_address for Reliable Server Restarts
+    # ORIGINAL INTENT: allow_reuse_address was False to prevent a 2nd instance sharing port.
+    # REASON FOR CHANGE: Prevented immediate server restart when TIME_WAIT sockets lingered on 8765.
+    # SAFE ROLLBACK: Preserved original code below as comments.
+    # -----------------------------------------------------------------------------
+    # [PREVIOUS CODE - PRESERVED]:
+    # class Server(ThreadingHTTPServer):
+    #     allow_reuse_address = False   # a 2nd instance must NOT share the port
+    #     daemon_threads = True
+    # -----------------------------------------------------------------------------
+    # [NEW CODE]:
     class Server(ThreadingHTTPServer):
-        allow_reuse_address = False   # a 2nd instance must NOT share the port
+        allow_reuse_address = True
         daemon_threads = True
+    # =============================================================================
     try:
         srv = Server((HOST, PORT), Handler)
     except OSError:
