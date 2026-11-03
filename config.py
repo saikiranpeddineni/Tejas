@@ -278,10 +278,32 @@ class Config:
     # integer — rotation still protects any healthy holding; this just stops
     # turning away new opportunities at the door while capital is available.
     MAX_OPEN_POSITIONS = int(os.getenv("MAX_OPEN_POSITIONS", "20"))
+    # =============================================================================
+    # [MODIFIED 2026-11-03]: Expand sector limits for diversified industries & energy
+    # ORIGINAL INTENT: SECTOR_LIMITS capped sector exposure as a fraction of equity.
+    # 'other' defaulted to 0.20 (20%), which instantly saturated when holding 2 stocks
+    # across the ~200 non-standard sectors in NIFTY 500 (auto, capital goods, telecom, realty).
+    # REASON FOR CHANGE: Prevent 1,142+ warnings and candidate rejections for non-correlated
+    # industrial and telecom stocks by expanding 'other' headroom to 35% and 'energy' to 25%.
+    # SAFE ROLLBACK: The original code is preserved below as comments.
+    # -----------------------------------------------------------------------------
+    # [PREVIOUS CODE - PRESERVED]:
+    #     SECTOR_LIMITS = {
+    #         "technology": 0.40, "finance": 0.25, "healthcare": 0.25,
+    #         "consumer":   0.20, "energy":  0.15, "etf": 0.30, "other": 0.20,
+    #     }
+    # -----------------------------------------------------------------------------
+    # [NEW CODE]:
     SECTOR_LIMITS = {
-        "technology": 0.40, "finance": 0.25, "healthcare": 0.25,
-        "consumer":   0.20, "energy":  0.15, "etf": 0.30, "other": 0.20,
+        "technology": float(os.getenv("SECTOR_LIMIT_TECH", "0.40")),
+        "finance":    float(os.getenv("SECTOR_LIMIT_FINANCE", "0.25")),
+        "healthcare": float(os.getenv("SECTOR_LIMIT_HEALTHCARE", "0.25")),
+        "consumer":   float(os.getenv("SECTOR_LIMIT_CONSUMER", "0.20")),
+        "energy":     float(os.getenv("SECTOR_LIMIT_ENERGY", "0.25")),
+        "etf":        float(os.getenv("SECTOR_LIMIT_ETF", "0.30")),
+        "other":      float(os.getenv("SECTOR_LIMIT_OTHER", "0.35")),
     }
+    # =============================================================================
 
     # ── ★ Position rotation (swap a decayed holding for a much stronger name) ────
     #   Problem this fixes: once the book is full (MAX_OPEN_POSITIONS) the loop used

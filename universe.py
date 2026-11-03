@@ -47,6 +47,28 @@ def _today() -> str:
     return datetime.now(_IST).date().isoformat()
 
 
+# =============================================================================
+# [MODIFIED 2026-11-03]: Expand sector 4 industry matching and sanitize universe tickers
+# ORIGINAL INTENT: _industry_code mapped NSE industry names to sector codes 0-6.
+# Metal and mining stocks with 'steel', 'iron', 'ferrous', or 'minerals' in their NSE
+# industry strings missed the keyword list and silently defaulted to sector 6 ('other'),
+# bottlenecking the 20% sector limit. Also dummy placeholder tickers were not stripped.
+# REASON FOR CHANGE: Resolve repeated 404 chart queries for dummy tickers (e.g. DUMMYHEG)
+# and prevent sector 6 ('other') saturation from blocking valid diverse candidates.
+# SAFE ROLLBACK: The original code is preserved below as comments.
+# -----------------------------------------------------------------------------
+# [PREVIOUS CODE - PRESERVED]:
+# def _industry_code(industry: str) -> int:
+#     """Map an NSE Industry label to the bot's sector code (0..6)."""
+#     i = industry.lower()
+#     if "information technology" in i:                          return 0
+#     if "financial" in i or "bank" in i:                        return 1
+#     if "healthcare" in i or "pharma" in i:                     return 2
+#     if any(w in i for w in ("consumer", "fast moving", "fmcg", "textile")): return 3
+#     if any(w in i for w in ("oil", "gas", "metal", "mining", "power", "energy", "coal")): return 4
+#     return 6  # other (capital goods, services, telecom, realty, auto, etc.)
+# -----------------------------------------------------------------------------
+# [NEW CODE]:
 def _industry_code(industry: str) -> int:
     """Map an NSE Industry label to the bot's sector code (0..6)."""
     i = industry.lower()
@@ -54,8 +76,9 @@ def _industry_code(industry: str) -> int:
     if "financial" in i or "bank" in i:                        return 1
     if "healthcare" in i or "pharma" in i:                     return 2
     if any(w in i for w in ("consumer", "fast moving", "fmcg", "textile")): return 3
-    if any(w in i for w in ("oil", "gas", "metal", "mining", "power", "energy", "coal")): return 4
+    if any(w in i for w in ("oil", "gas", "metal", "mining", "power", "energy", "coal", "steel", "iron", "ferrous", "minerals")): return 4
     return 6  # other (capital goods, services, telecom, realty, auto, etc.)
+# =============================================================================
 
 
 def _fetch(index: str):
@@ -96,10 +119,26 @@ def get_universe():
         valid_symbols = (isinstance(cached_symbols, list)
                          and all(isinstance(sym, str) and sym for sym in cached_symbols))
         valid_sectors = isinstance(cached_sectors, dict)
+# =============================================================================
+# [MODIFIED 2026-11-03]: Filter dummy/placeholder tickers from disk cache on load
+# ORIGINAL INTENT: Loaded cached_symbols directly from disk cache without sanitization.
+# REASON FOR CHANGE: Prevent dummy/corrupted tickers (e.g. DUMMYHEG) from being loaded.
+# SAFE ROLLBACK: The original code is preserved below as comments.
+# -----------------------------------------------------------------------------
+# [PREVIOUS CODE - PRESERVED]:
+#         if (d.get("date") == _today() and d.get("index") == index
+#                 and valid_symbols and bool(cached_symbols) and valid_sectors):
+#             _mem.update(date=_today(), index=index, symbols=cached_symbols, sectors=cached_sectors)
+#             return cached_symbols, cached_sectors
+# -----------------------------------------------------------------------------
+# [NEW CODE]:
         if (d.get("date") == _today() and d.get("index") == index
                 and valid_symbols and bool(cached_symbols) and valid_sectors):
-            _mem.update(date=_today(), index=index, symbols=cached_symbols, sectors=cached_sectors)
-            return cached_symbols, cached_sectors
+            clean_symbols = [s for s in cached_symbols if not s.upper().startswith("DUMMY") and s.isalnum()]
+            clean_sectors = {s: cached_sectors.get(s, 6) for s in clean_symbols}
+            _mem.update(date=_today(), index=index, symbols=clean_symbols, sectors=clean_sectors)
+            return clean_symbols, clean_sectors
+# =============================================================================
     except Exception:
         pass
 

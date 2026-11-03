@@ -1,1 +1,11 @@
-{"val_auc": 0.49240091739913316, "walk_forward_auc": 0.0}
+{
+  "val_auc": 0.49240091739913316,
+  "walk_forward_auc": 0.0,
+  "model_file": "lgb_gold.txt",
+  "models": {
+    "lgb_gold.txt": {
+      "val_auc": 0.49240091739913316,
+      "walk_forward_auc": 0.0
+    }
+  }
+}

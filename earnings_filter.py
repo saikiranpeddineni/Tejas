@@ -254,11 +254,34 @@ class EarningsFilter:
                     consec_fail = 0
             except Exception:
                 failed += 1
+        # =============================================================================
+        # [MODIFIED 2026-11-03]: Context-aware log levels for earnings budget throttling
+        # ORIGINAL INTENT: Always logged WARNING on early budget cutoff and failed calendar fetches.
+        # REASON FOR CHANGE: When running in paper mode, budget cutoff and failed external fetches
+        # fail open safely by design; emitting WARNINGs every 30s clutters production logs. In live
+        # trading (fail_closed=True), WARNING is retained to alert the operator of entry blocks.
+        # SAFE ROLLBACK: The original code is preserved below as comments.
+        # -----------------------------------------------------------------------------
+        # [PREVIOUS CODE - PRESERVED]:
+        #         if stopped_early:
+        #             mode = "blocked for live entries" if fail_closed else "fail open for paper"
+        #             log.warning(f"[Earnings] blackout pre-pass stopped early at {len(self._cache)}/{len(symbols)} "
+        #                         f"symbols; unchecked names {mode} this cycle")
+        #         if failed:
+        #             log.warning(f"[Earnings] {failed} calendar fetches failed; live entries blocked for those names "
+        #                         f"(retry in {self._fail_ttl//60}min)")
+        # -----------------------------------------------------------------------------
+        # [NEW CODE]:
         if stopped_early:
             mode = "blocked for live entries" if fail_closed else "fail open for paper"
-            log.warning(f"[Earnings] blackout pre-pass stopped early at {len(self._cache)}/{len(symbols)} "
-                        f"symbols; unchecked names {mode} this cycle")
+            lvl = logging.WARNING if fail_closed else logging.INFO
+            log.log(lvl, f"[Earnings] blackout pre-pass bounded at {len(self._cache)}/{len(symbols)} "
+                         f"symbols; unchecked names {mode} this cycle")
         if failed:
-            log.warning(f"[Earnings] {failed} calendar fetches failed; live entries blocked for those names "
-                        f"(retry in {self._fail_ttl//60}min)")
+            if fail_closed:
+                log.warning(f"[Earnings] {failed} calendar fetches failed; live entries blocked for those names "
+                            f"(retry in {self._fail_ttl//60}min)")
+            else:
+                log.debug(f"[Earnings] {failed} calendar fetches failed; retrying in {self._fail_ttl//60}min")
+        # =============================================================================
         return blackout

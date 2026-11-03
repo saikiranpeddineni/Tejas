@@ -1,6 +1,6 @@
 # Gates: Self-Healing Adaptive Trading Engine & Production Readiness Audit
 
-OWNS: adaptive_engine.py, autostart_manager.py, backtest_engine.py, brokers/simulated.py, db.py, dynamic_risk.py, earnings_filter.py, execution_engine.py, remove_autostart.bat, scheduler.py, sentiment_engine.py, setup_autostart.bat, signal_engine_gold.py, Start Tejas.vbs, tejas.py, tests/**, watchdog.py, webui.py
+OWNS: adaptive_engine.py, autostart_manager.py, backtest_engine.py, brokers/simulated.py, config.py, db.py, dynamic_risk.py, earnings_filter.py, execution_engine.py, models/ml_metrics.json, remove_autostart.bat, scheduler.py, sentiment_engine.py, setup_autostart.bat, signal_engine_gold.py, Start Tejas.vbs, tejas.py, tests/**, universe.local.json, universe.py, watchdog.py, webui.py
 
 Scope: Verify complete end-to-end implementation of the multi-tiered self-healing feedback engine, regression safety, paper and live trading parity, morning autostart and scheduling, and institutional production readiness constraints.
 
@@ -63,3 +63,28 @@ Scope: Verify complete end-to-end implementation of the multi-tiered self-healin
   CHECK: .venv\Scripts\python.exe tests/run_gates.py alphabot_sync ALPHABOT_SYNC_VERIFIED_SUCCESS
   EXPECT: ALPHABOT_SYNC_VERIFIED_SUCCESS
   EVIDENCE: automatic-evidence=v1; definition-sha256=7878625edbb92211349b7127fdddd2bd254f6c14d2511b6cfff77a9870775b5e; exit=0; EXPECT=matched; output-sha256=b49cffbc7f66fc95890a4356faf9f671446ffa0ff67b8c7736a51ce79bab7016; output-bytes=143; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=a5bbb5f35938/58 entries
+
+- [x] G13: Phantom symbol DUMMYHEG purged from universe cache and universe loader sanitized against dummy tickers
+  CHECK: .venv\Scripts\python.exe tests/run_gates.py log_anomalies LOG_ANOMALIES_VERIFIED_SUCCESS
+  EXPECT: LOG_ANOMALIES_VERIFIED_SUCCESS
+  EVIDENCE: automatic-evidence=v1; definition-sha256=31765556ad34588d6348c57b72a0275a7b6b3351167ed6a9d851c1c158c16558; exit=0; EXPECT=matched; output-sha256=bff2b269abde10e7e027a9dd996fda5c3d9b2bf6bcf8d6292a79e417df186b67; output-bytes=2146; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=33941c8ef8e1/57 entries
+
+- [x] G14: Sector classification and sector limit headroom unblock diversified non-correlated candidates
+  CHECK: .venv\Scripts\python.exe tests/run_gates.py log_anomalies LOG_ANOMALIES_VERIFIED_SUCCESS
+  EXPECT: LOG_ANOMALIES_VERIFIED_SUCCESS
+  EVIDENCE: automatic-evidence=v1; definition-sha256=31765556ad34588d6348c57b72a0275a7b6b3351167ed6a9d851c1c158c16558; exit=0; EXPECT=matched; output-sha256=25fcc63281a084e1bea677a3002e889ae294eb0dd92db137dba167ba39365d86; output-bytes=2146; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=33941c8ef8e1/57 entries
+
+- [x] G15: ML metrics metadata synchronized with lgb_gold.txt to activate ML trust validation
+  CHECK: .venv\Scripts\python.exe tests/run_gates.py log_anomalies LOG_ANOMALIES_VERIFIED_SUCCESS
+  EXPECT: LOG_ANOMALIES_VERIFIED_SUCCESS
+  EVIDENCE: automatic-evidence=v1; definition-sha256=31765556ad34588d6348c57b72a0275a7b6b3351167ed6a9d851c1c158c16558; exit=0; EXPECT=matched; output-sha256=c8fdbb86cbbeaaf501cba2aca49748b6fc754ce4b6f2639874ffc4c601878213; output-bytes=2146; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=33941c8ef8e1/57 entries
+
+- [x] G16: Unit test suite for log anomalies fixes passes with 100% assertions met
+  CHECK: .venv\Scripts\python.exe tests/run_gates.py log_anomalies LOG_ANOMALIES_VERIFIED_SUCCESS
+  EXPECT: LOG_ANOMALIES_VERIFIED_SUCCESS
+  EVIDENCE: automatic-evidence=v1; definition-sha256=31765556ad34588d6348c57b72a0275a7b6b3351167ed6a9d851c1c158c16558; exit=0; EXPECT=matched; output-sha256=4bd211d07a8be4e0c74c563fdd367157a7ab6bffe98cd67591310fe9fcbab919; output-bytes=2146; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=33941c8ef8e1/57 entries
+
+- [x] G17: Full regression discovery across all test suites passes without regressions
+  CHECK: .venv\Scripts\python.exe tests/run_gates.py discover ALL_TEST_SUITES_VERIFIED_SUCCESS
+  EXPECT: ALL_TEST_SUITES_VERIFIED_SUCCESS
+  EVIDENCE: automatic-evidence=v1; definition-sha256=824986bc3764bba2d32fb8089d2d6d42c8d2c475252e7b68a063cc1aac640a4b; exit=0; EXPECT=matched; output-sha256=a512d37a3fe179b064fcbcc943f534ef616f1543d3654aa090315770929b015e; output-bytes=3338; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=33941c8ef8e1/57 entries
