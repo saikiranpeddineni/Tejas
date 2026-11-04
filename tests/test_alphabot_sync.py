@@ -33,9 +33,41 @@ from adaptive_engine import AdaptiveFeedbackEngine
 
 
 class AlphaBotSyncTests(unittest.TestCase):
+    # =============================================================================
+    # [MODIFIED 2026-11-04]: Isolate test database from production tejas.db
+    # ORIGINAL INTENT: Initialized db directly on Config.DB_PATH / webui.DB_PATH.
+    # REASON FOR CHANGE: Calling webui.flatten_all_positions() during test runs
+    # previously wiped live paper trading positions in tejas.db.
+    # SAFE ROLLBACK: Preserved original setUpClass below as comments.
+    # -----------------------------------------------------------------------------
+    # [PREVIOUS CODE - PRESERVED]:
+    #     @classmethod
+    #     def setUpClass(cls):
+    #         db.init_db()
+    # -----------------------------------------------------------------------------
+    # [NEW CODE]:
     @classmethod
     def setUpClass(cls):
+        import tempfile
+        cls.tempdir = tempfile.TemporaryDirectory()
+        cls.test_db = os.path.join(cls.tempdir.name, "test_tejas.db")
+        cls.orig_config_db = Config.DB_PATH
+        cls.orig_webui_db = webui.DB_PATH
+        Config.DB_PATH = cls.test_db
+        webui.DB_PATH = cls.test_db
         db.init_db()
+
+    @classmethod
+    def tearDownClass(cls):
+        Config.DB_PATH = cls.orig_config_db
+        webui.DB_PATH = cls.orig_webui_db
+        import gc
+        gc.collect()
+        try:
+            cls.tempdir.cleanup()
+        except Exception:
+            pass
+    # =============================================================================
 
     def test_status_payload_alphabot_contract(self):
         """Verify that webui.status() satisfies both AlphaBot and legacy Tejas contracts."""

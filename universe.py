@@ -94,8 +94,20 @@ def _fetch(index: str):
         if len(parts) < 4:
             continue
         industry, sym, series = parts[1].strip(), parts[2].strip(), parts[3].strip()
-        if not sym or series.upper() != "EQ":
+        # =============================================================================
+        # [MODIFIED 2026-11-04]: Reject dummy and non-alphanumeric tickers in _fetch
+        # ORIGINAL INTENT: Accepted all series == 'EQ' rows without symbol sanitization.
+        # REASON FOR CHANGE: Prevent dummy tickers (e.g. DUMMYHEG) from being fetched and cached.
+        # SAFE ROLLBACK: Preserved original check below as comments.
+        # -----------------------------------------------------------------------------
+        # [PREVIOUS CODE - PRESERVED]:
+        #         if not sym or series.upper() != "EQ":
+        #             continue
+        # -----------------------------------------------------------------------------
+        # [NEW CODE]:
+        if not sym or series.upper() != "EQ" or sym.upper().startswith("DUMMY") or not sym.isalnum():
             continue
+        # =============================================================================
         symbols.append(sym)
         sectors[sym] = _industry_code(industry)
     return symbols, sectors

@@ -19,9 +19,42 @@ from backtest_engine import BacktestEngine
 
 
 class BacktestReplayTests(unittest.TestCase):
+    # =============================================================================
+    # [MODIFIED 2026-11-04]: Isolate backtest test database from production tejas.db
+    # ORIGINAL INTENT: Initialized db directly on Config.DB_PATH / webui.DB_PATH.
+    # REASON FOR CHANGE: Prevent test executions from mutating production database state.
+    # SAFE ROLLBACK: Preserved original setUpClass below as comments.
+    # -----------------------------------------------------------------------------
+    # [PREVIOUS CODE - PRESERVED]:
+    #     @classmethod
+    #     def setUpClass(cls):
+    #         db.init_db()
+    # -----------------------------------------------------------------------------
+    # [NEW CODE]:
     @classmethod
     def setUpClass(cls):
+        import os, tempfile
+        from config import Config
+        cls.tempdir = tempfile.TemporaryDirectory()
+        cls.test_db = os.path.join(cls.tempdir.name, "test_backtest.db")
+        cls.orig_config_db = Config.DB_PATH
+        cls.orig_webui_db = webui.DB_PATH
+        Config.DB_PATH = cls.test_db
+        webui.DB_PATH = cls.test_db
         db.init_db()
+
+    @classmethod
+    def tearDownClass(cls):
+        from config import Config
+        Config.DB_PATH = cls.orig_config_db
+        webui.DB_PATH = cls.orig_webui_db
+        import gc
+        gc.collect()
+        try:
+            cls.tempdir.cleanup()
+        except Exception:
+            pass
+    # =============================================================================
 
     def test_backtest_engine_execution_and_progress(self):
         """Verify that BacktestEngine ticks through sessions and emits progress."""
