@@ -525,9 +525,39 @@ def start_bot(opts: dict, source: str = "ui") -> dict:
                     "ENABLE_LIVE_TRADING")}
         bot_cfg["mode"] = mode_req
         if source == "ui":
-            # Remember these for the auto-supervisor, and clear any manual pause.
+            # =============================================================================
+            # [MODIFIED 2026-11-05]: Persist the validated bankroll/scan back into opts before saving
+            # ORIGINAL INTENT: save_autostart_opts(opts) used the raw opts dict which
+            # could still have bankroll=null or scan=null from an old autostart.local.json.
+            # This caused autostart.local.json to retain null for these fields, breaking
+            # the status() fallback that reads bankroll from autostart.local.json.
+            # REASON FOR CHANGE: After _num() validation produces the actual BANKROLL/SCAN
+            # env values, write them back into opts before persisting so the saved file
+            # always has valid numerics for the next startup and for the P&L start baseline.
+            # SAFE ROLLBACK: Remove the two opts[...] lines below (revert to only save_autostart_opts(opts))
+            # -----------------------------------------------------------------------------
+            # [PREVIOUS CODE - PRESERVED]:
+            # save_autostart_opts(opts)
+            # -----------------------------------------------------------------------------
+            # [NEW CODE]:
+            opts["bankroll"] = env["BANKROLL"]   # persist validated bankroll, not null
+            opts["scan"]     = env["SCAN_INTERVAL_SECONDS"]  # persist validated scan
             save_autostart_opts(opts)
+            # =============================================================================
             set_paused(False)
+        elif source == "auto":
+            # =============================================================================
+            # [MODIFIED 2026-11-05]: Persist validated bankroll from auto-start too
+            # ORIGINAL INTENT: auto-start never called save_autostart_opts, so bankroll
+            # remained null in the file even after a successful auto-start launch.
+            # REASON FOR CHANGE: Ensures autostart.local.json always has the real bankroll
+            # for the status() fallback, even when the bot is auto-started by the supervisor.
+            # SAFE ROLLBACK: Remove this elif block entirely.
+            # -----------------------------------------------------------------------------
+            opts["bankroll"] = env["BANKROLL"]
+            opts["scan"]     = env["SCAN_INTERVAL_SECONDS"]
+            save_autostart_opts(opts)
+            # =============================================================================
         return {"ok": True, "pid": bot_proc.pid}
 
 
@@ -803,6 +833,21 @@ def open_positions() -> list[dict]:
 _system_health = "NORMAL"
 _allow_new_entries = True
 _adaptive_engine_instance = None
+
+# =============================================================================
+# [MODIFIED 2026-11-05]: Sticky equity cache to prevent P&L blink-reset to ₹100,000
+# ORIGINAL INTENT: status() used `equity if equity is not None else start` where
+# start defaults to 100000. When the 128KB tail_log window misses the [Main] Cycle
+# line (log rotation boundary, slow disk), equity=None → P&L resets to ₹0 for
+# one or two polls before the cycle line re-appears, causing visible blink to 100000.
+# REASON FOR CHANGE: Persist the last successfully parsed equity value across polls
+# so a momentary log-parse miss never zeroes out the displayed P&L.
+# SAFE ROLLBACK: Remove _last_equity and revert status() to use `equity if equity
+#                is not None else start` (original two lines preserved below).
+# -----------------------------------------------------------------------------
+# [NEW CODE]:
+_last_equity: float | None = None   # sticky: survives a single missed log parse
+# =============================================================================
 
 def get_adaptive_engine():
     global _adaptive_engine_instance
@@ -1164,6 +1209,7 @@ def run_backtest_eval(
 # =============================================================================
 
 def status() -> dict:
+    global _last_equity
     log = tail_log(150)
     equity = regime = vix = cycle = dd = open_n = None
     for line in reversed(log):
@@ -1176,8 +1222,34 @@ def status() -> dict:
         v = _VIX_RE.search(line)
         if v:
             vix = float(v.group(1)); break
-    start = float(bot_cfg.get("BANKROLL", 100000) or 100000)
-    cur_equity = equity if equity is not None else start
+
+    # =============================================================================
+    # [MODIFIED 2026-11-05]: Fix P&L blink-reset to ₹100,000 on log parse miss
+    # ORIGINAL INTENT: `start` from bot_cfg only (empty dict when bot not started
+    # via dashboard), so start always fell back to hardcoded 100000. `cur_equity`
+    # fell back to `start` when log parse missed a cycle line, causing P&L to
+    # blink to ₹0 for one or two polls every time the 128KB tail window skips a cycle.
+    # REASON FOR CHANGE: (1) Read BANKROLL from autostart opts when bot_cfg is empty
+    # so `start` is always the real configured bankroll. (2) Use `_last_equity` sticky
+    # cache: when the log parse misses (rotation boundary, slow disk), serve the last
+    # known equity rather than resetting cur_equity to start=100000.
+    # SAFE ROLLBACK: Remove the _last_equity lines and revert to the two lines below:
+    # [PREVIOUS CODE - PRESERVED]:
+    # start = float(bot_cfg.get("BANKROLL", 100000) or 100000)
+    # cur_equity = equity if equity is not None else start
+    # -----------------------------------------------------------------------------
+    # [NEW CODE]:
+    _saved_br = load_autostart_opts().get("bankroll")
+    try:
+        _saved_bankroll = float(_saved_br) if _saved_br is not None else 100000.0
+    except (TypeError, ValueError):
+        _saved_bankroll = 100000.0
+    start = float(bot_cfg.get("BANKROLL") or _saved_bankroll)
+    if equity is not None:
+        _last_equity = equity          # update sticky cache on successful parse
+    cur_equity = _last_equity if _last_equity is not None else start
+    # =============================================================================
+
     run_pnl = (cur_equity - start) if cur_equity is not None else 0.0
     run_pct = (run_pnl / start * 100) if run_pnl is not None and start else 0.0
     feed = [l for l in log if any(t in l for t in

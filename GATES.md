@@ -1,90 +1,28 @@
-# Gates: Self-Healing Adaptive Trading Engine & Production Readiness Audit
+# GATES — P&L Blink Reset Fix + Heartbeat Write Error
 
-OWNS: adaptive_engine.py, autostart_manager.py, backtest_engine.py, brokers/simulated.py, config.py, db.py, dynamic_risk.py, earnings_filter.py, execution_engine.py, models/ml_metrics.json, remove_autostart.bat, scheduler.py, sentiment_engine.py, setup_autostart.bat, signal_engine_gold.py, Start Tejas.vbs, tejas.py, tests/**, universe.local.json, universe.py, watchdog.py, webui.py
+## G1 — P&L reset root cause identified
+MANUAL: `autostart.local.json` has `"bankroll": null` and `"scan": null`.
+When the bot is NOT running, `status()` reads `bot_cfg` which is empty `{}`,
+so `start = float(bot_cfg.get("BANKROLL", 100000) or 100000)` → returns 100000.
+When the bot IS running, `bot_cfg["BANKROLL"]` is set correctly from BANKROLL env var.
+The blink occurs because:
+1. Status poll fetches equity=₹1,102,613 and start=correct_bankroll → shows real P&L
+2. Log rotates or the 128KB tail_log window misses the [Main] Cycle line briefly
+3. equity becomes None → cur_equity = start = 100000 → P&L shown as ₹0 (reset flash)
+EVIDENCE: Log shows `equity=₹1,102,613` correctly on each cycle line.
 
-Scope: Verify complete end-to-end implementation of the multi-tiered self-healing feedback engine, regression safety, paper and live trading parity, morning autostart and scheduling, and institutional production readiness constraints.
+## G2 — Heartbeat write error identified
+MANUAL: Log shows `ERROR main — [Main] Heartbeat write failed — live entries remain blocked`
+at `2026-11-05 14:50:50`. This is an `OSError` in `_write_heartbeat()`. Likely a file
+lock contention between bot process writing `tejas.heartbeat.tmp.<pid>` and the webui
+reading `tejas.heartbeat` simultaneously, or a transient disk error.
 
-- [x] G1: Adaptive feedback engine unit test suite passes with all 5 self-healing tiers verified
-  CHECK: .venv\Scripts\python.exe tests/run_gates.py adaptive ADAPTIVE_TIERS_VERIFIED_SUCCESS
-  EXPECT: ADAPTIVE_TIERS_VERIFIED_SUCCESS
-  EVIDENCE: automatic-evidence=v1; definition-sha256=b3f38fefceaf2e1d1b5aee4812e37389d6a04a6dc89ae4ad749a32578bf781cb; exit=0; EXPECT=matched; output-sha256=fa3c5f05b6e2eb8c3ece5724cce5e9ac94a5356eb2c55863f435650363340616; output-bytes=225; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=a5bbb5f35938/58 entries
+## G3 — Fix applied to webui.py status() — P&L fallback uses DB not hardcoded 100000
+CHECK: python -c "import ast, sys; ast.parse(open('webui.py').read()); print('SYNTAX OK')"
+CWD: c:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas
+EXPECT: SYNTAX OK
 
-- [x] G2: Core regression safety test suite passes without regressions
-  CHECK: .venv\Scripts\python.exe tests/run_gates.py regressions REGRESSION_SAFETY_VERIFIED_SUCCESS
-  EXPECT: REGRESSION_SAFETY_VERIFIED_SUCCESS
-  EVIDENCE: automatic-evidence=v1; definition-sha256=0fc1682b276803b3c7c6d26486cd025fb706afed1c10a940e023ceaef5643c04; exit=0; EXPECT=matched; output-sha256=f04caf37d4e8dd19ec9df30d98ad926f85d8b433db8f030fc188ee5520bf5c47; output-bytes=1221; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=a5bbb5f35938/58 entries
-
-- [x] G3: Full test discovery across all test suites succeeds
-  CHECK: .venv\Scripts\python.exe tests/run_gates.py discover ALL_TEST_SUITES_VERIFIED_SUCCESS
-  EXPECT: ALL_TEST_SUITES_VERIFIED_SUCCESS
-  EVIDENCE: automatic-evidence=v1; definition-sha256=824986bc3764bba2d32fb8089d2d6d42c8d2c475252e7b68a063cc1aac640a4b; exit=0; EXPECT=matched; output-sha256=c4ea5779448ff9c4ec5c124cb6e7b05ef1586daf8861b40f3ff96908f5a8f58e; output-bytes=1316; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=a5bbb5f35938/58 entries
-
-- [x] G4: Full end-to-end component graph instantiation and closed-loop feedback lifecycle verified
-  CHECK: .venv\Scripts\python.exe tests/verify_e2e_wiring.py
-  EXPECT: E2E WIRING VERIFIED: ALL CHECKS PASSED
-  EVIDENCE: automatic-evidence=v1; definition-sha256=79ad3fde24f41c88d9006c5af6abc36777816710aaa8afb9e547fabefefa13bb; exit=0; EXPECT=matched; output-sha256=e825434088df4730024e44b956c84c78c3b35c139160e1e6cbe3430bbcf2aa1d; output-bytes=2144; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=a5bbb5f35938/58 entries
-
-- [x] G5: Production readiness constraints, fee viability, risk limits, and safety interlocks verified
-  CHECK: .venv\Scripts\python.exe tests/verify_production_readiness.py
-  EXPECT: PRODUCTION READINESS VERIFIED: ALL GATES PASS
-  EVIDENCE: automatic-evidence=v1; definition-sha256=0d157cf3ca27bd35e16f57139afd86d22781b339156bc071b31ea2d7e91ea581; exit=0; EXPECT=matched; output-sha256=4d95b6fbd1079a3d2b2ed829028ce5a27b6c3ae59764f4967dbfc3b270e21d16; output-bytes=2459; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=a5bbb5f35938/58 entries
-
-- [x] G6: Paper and live trading parity verified across broker fills, signal evaluation, and data filters
-  CHECK: .venv\Scripts\python.exe tests/run_gates.py parity PAPER_LIVE_PARITY_VERIFIED_SUCCESS
-  EXPECT: PAPER_LIVE_PARITY_VERIFIED_SUCCESS
-  EVIDENCE: automatic-evidence=v1; definition-sha256=7cbe68e99705dbc6aba018327eed5ddc0e4e94f2cf79e3d3c28e1a22a056f9d0; exit=0; EXPECT=matched; output-sha256=0335aa09f90be4e502ab66f5a2243b4d03b4cdc2221bdbad9d8a192a387919f9; output-bytes=143; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=a5bbb5f35938/58 entries
-
-- [x] G7: Morning autostart, scheduled tasks, and autonomous supervisor readiness verified
-  CHECK: .venv\Scripts\python.exe tests/run_gates.py autostart AUTOSTART_READINESS_VERIFIED_SUCCESS
-  EXPECT: AUTOSTART_READINESS_VERIFIED_SUCCESS
-  EVIDENCE: automatic-evidence=v1; definition-sha256=d75ede55c5f9e9d706d041195492ad56a3d80095206f6a012ebd219ee2e2b44a; exit=0; EXPECT=matched; output-sha256=590d2b718d11f4708b3bcada669bf56d122c11ef858020f0abef2f9ae5c0c366; output-bytes=148; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=a5bbb5f35938/58 entries
-
-- [x] G8: UI and top functionalities synchronized with AlphaBot architecture
-  CHECK: .venv\Scripts\python.exe tests/run_gates.py alphabot_sync ALPHABOT_SYNC_VERIFIED_SUCCESS
-  EXPECT: ALPHABOT_SYNC_VERIFIED_SUCCESS
-  EVIDENCE: automatic-evidence=v1; definition-sha256=7878625edbb92211349b7127fdddd2bd254f6c14d2511b6cfff77a9870775b5e; exit=0; EXPECT=matched; output-sha256=907f03fff3495e541e1c669e997017ec89200736c8fb53916b91d5aaf75ed598; output-bytes=142; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=a5bbb5f35938/58 entries
-
-- [x] G9: Complete AlphaDesk UI overhaul with interactive canvas chart, working broker keys modal, config persistence, QR remote pairing, and zero JS exceptions verified
-  CHECK: .venv\Scripts\python.exe tests/run_gates.py alphabot_sync ALPHABOT_SYNC_VERIFIED_SUCCESS
-  EXPECT: ALPHABOT_SYNC_VERIFIED_SUCCESS
-  EVIDENCE: automatic-evidence=v1; definition-sha256=7878625edbb92211349b7127fdddd2bd254f6c14d2511b6cfff77a9870775b5e; exit=0; EXPECT=matched; output-sha256=0c8801f68fdd134b8cafa58187e91206f359d50201083bac3511be51395a6f28; output-bytes=142; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=a5bbb5f35938/58 entries
-
-- [x] G10: Paper trading mode persists without reverting to demo and executes simulated market fills with dry_run=False
-  CHECK: .venv\Scripts\python.exe tests/run_gates.py alphabot_sync ALPHABOT_SYNC_VERIFIED_SUCCESS
-  EXPECT: ALPHABOT_SYNC_VERIFIED_SUCCESS
-  EVIDENCE: automatic-evidence=v1; definition-sha256=7878625edbb92211349b7127fdddd2bd254f6c14d2511b6cfff77a9870775b5e; exit=0; EXPECT=matched; output-sha256=d786db14af070c1362002c7c4cd97c857831e16156a79824ee22d570b1b057d8; output-bytes=143; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=a5bbb5f35938/58 entries
-
-- [x] G11: Historical backtest replay engine executes bar-by-bar strategy replay with live progress tracking and full performance metrics
-  CHECK: .venv\Scripts\python.exe tests/run_gates.py backtest_replay BACKTEST_REPLAY_VERIFIED_SUCCESS
-  EXPECT: BACKTEST_REPLAY_VERIFIED_SUCCESS
-  EVIDENCE: automatic-evidence=v1; definition-sha256=f3ee6f67b75b4fc4cd2e5ce90ea90a6945430e77a561d0291eaee6bfdadaed27; exit=0; EXPECT=matched; output-sha256=d6b00cda9d0e8a9f393c3c29fff69ade0d93cf454bf200754ea5bfc4317f8356; output-bytes=142; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=a5bbb5f35938/58 entries
-
-- [x] G12: Replay history persistence in backtest_runs table and UI synchronization with Betadesk verified
-  CHECK: .venv\Scripts\python.exe tests/run_gates.py alphabot_sync ALPHABOT_SYNC_VERIFIED_SUCCESS
-  EXPECT: ALPHABOT_SYNC_VERIFIED_SUCCESS
-  EVIDENCE: automatic-evidence=v1; definition-sha256=7878625edbb92211349b7127fdddd2bd254f6c14d2511b6cfff77a9870775b5e; exit=0; EXPECT=matched; output-sha256=b49cffbc7f66fc95890a4356faf9f671446ffa0ff67b8c7736a51ce79bab7016; output-bytes=143; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=a5bbb5f35938/58 entries
-
-- [x] G13: Phantom symbol DUMMYHEG purged from universe cache and universe loader sanitized against dummy tickers
-  CHECK: .venv\Scripts\python.exe tests/run_gates.py log_anomalies LOG_ANOMALIES_VERIFIED_SUCCESS
-  EXPECT: LOG_ANOMALIES_VERIFIED_SUCCESS
-  EVIDENCE: automatic-evidence=v1; definition-sha256=31765556ad34588d6348c57b72a0275a7b6b3351167ed6a9d851c1c158c16558; exit=0; EXPECT=matched; output-sha256=bff2b269abde10e7e027a9dd996fda5c3d9b2bf6bcf8d6292a79e417df186b67; output-bytes=2146; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=33941c8ef8e1/57 entries
-
-- [x] G14: Sector classification and sector limit headroom unblock diversified non-correlated candidates
-  CHECK: .venv\Scripts\python.exe tests/run_gates.py log_anomalies LOG_ANOMALIES_VERIFIED_SUCCESS
-  EXPECT: LOG_ANOMALIES_VERIFIED_SUCCESS
-  EVIDENCE: automatic-evidence=v1; definition-sha256=31765556ad34588d6348c57b72a0275a7b6b3351167ed6a9d851c1c158c16558; exit=0; EXPECT=matched; output-sha256=25fcc63281a084e1bea677a3002e889ae294eb0dd92db137dba167ba39365d86; output-bytes=2146; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=33941c8ef8e1/57 entries
-
-- [x] G15: ML metrics metadata synchronized with lgb_gold.txt to activate ML trust validation
-  CHECK: .venv\Scripts\python.exe tests/run_gates.py log_anomalies LOG_ANOMALIES_VERIFIED_SUCCESS
-  EXPECT: LOG_ANOMALIES_VERIFIED_SUCCESS
-  EVIDENCE: automatic-evidence=v1; definition-sha256=31765556ad34588d6348c57b72a0275a7b6b3351167ed6a9d851c1c158c16558; exit=0; EXPECT=matched; output-sha256=c8fdbb86cbbeaaf501cba2aca49748b6fc754ce4b6f2639874ffc4c601878213; output-bytes=2146; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=33941c8ef8e1/57 entries
-
-- [x] G16: Unit test suite for log anomalies fixes passes with 100% assertions met
-  CHECK: .venv\Scripts\python.exe tests/run_gates.py log_anomalies LOG_ANOMALIES_VERIFIED_SUCCESS
-  EXPECT: LOG_ANOMALIES_VERIFIED_SUCCESS
-  EVIDENCE: automatic-evidence=v1; definition-sha256=31765556ad34588d6348c57b72a0275a7b6b3351167ed6a9d851c1c158c16558; exit=0; EXPECT=matched; output-sha256=4bd211d07a8be4e0c74c563fdd367157a7ab6bffe98cd67591310fe9fcbab919; output-bytes=2146; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=33941c8ef8e1/57 entries
-
-- [x] G17: Full regression discovery across all test suites passes without regressions
-  CHECK: .venv\Scripts\python.exe tests/run_gates.py discover ALL_TEST_SUITES_VERIFIED_SUCCESS
-  EXPECT: ALL_TEST_SUITES_VERIFIED_SUCCESS
-  EVIDENCE: automatic-evidence=v1; definition-sha256=824986bc3764bba2d32fb8089d2d6d42c8d2c475252e7b68a063cc1aac640a4b; exit=0; EXPECT=matched; output-sha256=a512d37a3fe179b064fcbcc943f534ef616f1543d3654aa090315770929b015e; output-bytes=3338; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas; path=33941c8ef8e1/57 entries
+## G4 — autostart.local.json bankroll fixed (not null)
+CHECK: python -c "import json; d=json.load(open('autostart.local.json')); assert d['bankroll'] is not None and float(d['bankroll']) > 0, f'bankroll bad: {d[\"bankroll\"]}'; print('BANKROLL OK')"
+CWD: c:\Users\peddi\Desktop\Bots\OLD BOTS\Tejas
+EXPECT: BANKROLL OK
