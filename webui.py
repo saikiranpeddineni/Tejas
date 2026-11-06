@@ -722,46 +722,157 @@ def tail_log(n: int = 150) -> list[str]:
 #         return []
 #     return [{"symbol": r["symbol"], "entry_price": r["entry_price"], "exit_price": r["exit_price"], "pnl_usd": r["pnl_usd"], "pnl_pct": r["pnl_pct"], "exit_reason": r["exit_reason"] or "", "rationale": r["rationale"] or "", "trimmed": bool(r["trim_shares"] and r["trim_shares"] > 0), "entry_time": r["entry_time"], "exit_time": r["exit_time"]} for r in rows]
 # -----------------------------------------------------------------------------
+# =============================================================================
+# [MODIFIED 2026-11-06]: Include partial trim profit realization in trade history & positions
+# ORIGINAL INTENT: trade_history only queried WHERE status='closed', hiding partial take-profit
+# trims. open_positions did not select trim_shares/trim_price or adjust active running shares.
+# REASON FOR CHANGE: Partial TP realizes real cash profits that must be visible in the Trades
+# tab and badged in the Positions tab.
+# SAFE ROLLBACK: Preserved previous logic below.
+# -----------------------------------------------------------------------------
+# [PREVIOUS CODE - PRESERVED]:
+# def trade_history(limit: int = 50) -> list[dict]:
+#     """Closed trades with entry/exit prices, P&L, and reasons for review."""
+#     try:
+#         c = sqlite3.connect(DB_PATH, timeout=5)
+#         c.row_factory = sqlite3.Row
+#         rows = c.execute(
+#             "SELECT symbol, entry_price, exit_price, pnl_usd, pnl_pct, exit_reason, "
+#             "rationale, entry_time, exit_time, trim_shares, trim_price "
+#             "FROM trades WHERE status='closed' ORDER BY exit_time DESC LIMIT ?",
+#             (limit,),
+#         ).fetchall()
+#         c.close()
+#     except Exception:
+#         return []
+#     out = []
+#     for r in rows:
+#         pnl = float(r["pnl_usd"] or 0.0)
+#         pnl_pct = float(r["pnl_pct"] or 0.0)
+#         en = float(r["entry_price"] or 0.0)
+#         ex = float(r["exit_price"] or en)
+#         reason = str(r["exit_reason"] or "RESOLVED").upper()
+#         if pnl < 0:
+#             attr = "SL_BREACH" if "STOP" in reason else ("WHIPSAW" if "WHIP" in reason else "VOLATILITY_EXPANSION")
+#         else:
+#             attr = "PROFIT_TARGET" if "TARGET" in reason else "MOMENTUM_RUNNER"
+#         out.append({
+#             "symbol": r["symbol"],
+#             "entry_price": round(en, 2),
+#             "exit_price": round(ex, 2),
+#             "pnl_usd": round(pnl, 2),
+#             "pnl_pct": round(pnl_pct, 2),
+#             "exit_reason": r["exit_reason"] or "CLOSED",
+#             "attribution": attr,
+#             "rationale": r["rationale"] or "GoldML Strategy",
+#             "trimmed": bool(r["trim_shares"] and r["trim_shares"] > 0),
+#             "entry_time": r["entry_time"],
+#             "exit_time": r["exit_time"],
+#         })
+#     return out
+# 
+# 
+# def open_positions() -> list[dict]:
+#     try:
+#         c = sqlite3.connect(DB_PATH, timeout=5)
+#         c.row_factory = sqlite3.Row
+#         rows = c.execute(
+#             "SELECT symbol, size_usd, shares, entry_price, stop_loss, take_profit, entry_time "
+#             "FROM trades WHERE status='open' ORDER BY entry_time DESC"
+#         ).fetchall()
+#         c.close()
+#     except Exception:
+#         return []
+#     out = []
+#     for r in rows:
+#         p = dict(r)
+#         en = float(p.get("entry_price") or 2500.0)
+#         cur = cached_price(p["symbol"]) or en
+#         shares = float(p.get("shares") or 1.0)
+#         p["entry_price"] = round(en, 2)
+#         p["current_price"] = round(cur, 2)
+#         p["shares"] = shares
+#         p["stop_loss"] = float(p["stop_loss"]) if p.get("stop_loss") else round(en * 0.98, 2)
+#         p["take_profit"] = float(p["take_profit"]) if p.get("take_profit") else round(en * 1.04, 2)
+#         p["pnl_usd"] = round((cur - en) * shares, 2)
+#         p["pnl_pct"] = round(((cur - en) / en * 100) if en > 0 else 0.0, 2)
+#         out.append(p)
+#     return out
+# -----------------------------------------------------------------------------
 # [NEW CODE]:
 def trade_history(limit: int = 50) -> list[dict]:
-    """Closed trades with entry/exit prices, P&L, and reasons for review."""
+    """Closed trades and realized partial trims with entry/exit prices, P&L, and reasons for review."""
+    out = []
     try:
         c = sqlite3.connect(DB_PATH, timeout=5)
         c.row_factory = sqlite3.Row
-        rows = c.execute(
+
+        # 1. Fetch active open trades with realized partial trims
+        trim_rows = c.execute(
+            "SELECT symbol, entry_price, exit_price, pnl_usd, pnl_pct, exit_reason, "
+            "rationale, entry_time, exit_time, trim_shares, trim_price, status "
+            "FROM trades WHERE status='open' AND trim_shares > 0 ORDER BY entry_time DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+        for r in trim_rows:
+            en = float(r["entry_price"] or 0.0)
+            t_price = float(r["trim_price"] or 0.0)
+            t_shares = float(r["trim_shares"] or 0.0)
+            if t_shares > 0 and t_price > 0 and en > 0:
+                trim_pnl_usd = (t_price - en) * t_shares
+                trim_pnl_pct = ((t_price - en) / en) * 100.0
+                out.append({
+                    "symbol": f"{r['symbol']} (Trim)",
+                    "entry_price": round(en, 2),
+                    "exit_price": round(t_price, 2),
+                    "pnl_usd": round(trim_pnl_usd, 2),
+                    "pnl_pct": round(trim_pnl_pct, 2),
+                    "exit_reason": "PARTIAL_TP",
+                    "attribution": "PROFIT_TARGET",
+                    "rationale": r["rationale"] or "Partial Take-Profit Locked",
+                    "trimmed": True,
+                    "entry_time": r["entry_time"],
+                    "exit_time": r["entry_time"],
+                    "is_trim": True,
+                })
+
+        # 2. Fetch fully closed trades
+        closed_rows = c.execute(
             "SELECT symbol, entry_price, exit_price, pnl_usd, pnl_pct, exit_reason, "
             "rationale, entry_time, exit_time, trim_shares, trim_price "
             "FROM trades WHERE status='closed' ORDER BY exit_time DESC LIMIT ?",
             (limit,),
         ).fetchall()
         c.close()
+
+        for r in closed_rows:
+            pnl = float(r["pnl_usd"] or 0.0)
+            pnl_pct = float(r["pnl_pct"] or 0.0)
+            en = float(r["entry_price"] or 0.0)
+            ex = float(r["exit_price"] or en)
+            reason = str(r["exit_reason"] or "RESOLVED").upper()
+            if pnl < 0:
+                attr = "SL_BREACH" if "STOP" in reason else ("WHIPSAW" if "WHIP" in reason else "VOLATILITY_EXPANSION")
+            else:
+                attr = "PROFIT_TARGET" if "TARGET" in reason else "MOMENTUM_RUNNER"
+            out.append({
+                "symbol": r["symbol"],
+                "entry_price": round(en, 2),
+                "exit_price": round(ex, 2),
+                "pnl_usd": round(pnl, 2),
+                "pnl_pct": round(pnl_pct, 2),
+                "exit_reason": r["exit_reason"] or "CLOSED",
+                "attribution": attr,
+                "rationale": r["rationale"] or "GoldML Strategy",
+                "trimmed": bool(r["trim_shares"] and r["trim_shares"] > 0),
+                "entry_time": r["entry_time"],
+                "exit_time": r["exit_time"],
+                "is_trim": False,
+            })
     except Exception:
         return []
-    out = []
-    for r in rows:
-        pnl = float(r["pnl_usd"] or 0.0)
-        pnl_pct = float(r["pnl_pct"] or 0.0)
-        en = float(r["entry_price"] or 0.0)
-        ex = float(r["exit_price"] or en)
-        reason = str(r["exit_reason"] or "RESOLVED").upper()
-        if pnl < 0:
-            attr = "SL_BREACH" if "STOP" in reason else ("WHIPSAW" if "WHIP" in reason else "VOLATILITY_EXPANSION")
-        else:
-            attr = "PROFIT_TARGET" if "TARGET" in reason else "MOMENTUM_RUNNER"
-        out.append({
-            "symbol": r["symbol"],
-            "entry_price": round(en, 2),
-            "exit_price": round(ex, 2),
-            "pnl_usd": round(pnl, 2),
-            "pnl_pct": round(pnl_pct, 2),
-            "exit_reason": r["exit_reason"] or "CLOSED",
-            "attribution": attr,
-            "rationale": r["rationale"] or "GoldML Strategy",
-            "trimmed": bool(r["trim_shares"] and r["trim_shares"] > 0),
-            "entry_time": r["entry_time"],
-            "exit_time": r["exit_time"],
-        })
-    return out
+    return out[:limit]
 
 
 def open_positions() -> list[dict]:
@@ -769,7 +880,8 @@ def open_positions() -> list[dict]:
         c = sqlite3.connect(DB_PATH, timeout=5)
         c.row_factory = sqlite3.Row
         rows = c.execute(
-            "SELECT symbol, size_usd, shares, entry_price, stop_loss, take_profit, entry_time "
+            "SELECT symbol, size_usd, shares, entry_price, stop_loss, take_profit, entry_time, "
+            "trim_shares, trim_price "
             "FROM trades WHERE status='open' ORDER BY entry_time DESC"
         ).fetchall()
         c.close()
@@ -780,16 +892,32 @@ def open_positions() -> list[dict]:
         p = dict(r)
         en = float(p.get("entry_price") or 2500.0)
         cur = cached_price(p["symbol"]) or en
-        shares = float(p.get("shares") or 1.0)
+        initial_shares = float(p.get("shares") or 1.0)
+        trim_shares = float(p.get("trim_shares") or 0.0)
+        trim_price = float(p.get("trim_price") or 0.0)
+        active_shares = max(0.0, initial_shares - trim_shares) if trim_shares > 0 else initial_shares
+
         p["entry_price"] = round(en, 2)
         p["current_price"] = round(cur, 2)
-        p["shares"] = shares
+        p["shares"] = active_shares
+        p["initial_shares"] = initial_shares
+        p["trim_shares"] = trim_shares
+        p["trim_price"] = trim_price
+
+        if trim_shares > 0 and trim_price > 0 and en > 0:
+            p["trimmed_profit_usd"] = round((trim_price - en) * trim_shares, 2)
+            p["trimmed_profit_pct"] = round(((trim_price - en) / en) * 100.0, 2)
+        else:
+            p["trimmed_profit_usd"] = 0.0
+            p["trimmed_profit_pct"] = 0.0
+
         p["stop_loss"] = float(p["stop_loss"]) if p.get("stop_loss") else round(en * 0.98, 2)
         p["take_profit"] = float(p["take_profit"]) if p.get("take_profit") else round(en * 1.04, 2)
-        p["pnl_usd"] = round((cur - en) * shares, 2)
+        p["pnl_usd"] = round((cur - en) * active_shares, 2)
         p["pnl_pct"] = round(((cur - en) / en * 100) if en > 0 else 0.0, 2)
         out.append(p)
     return out
+# =============================================================================
 # =============================================================================
 
 
@@ -2781,6 +2909,44 @@ function switchTab(tab) {
   else if (tab === "logs") renderLogs(state.status?.log || []);
 }
 
+// =============================================================================
+// [MODIFIED 2026-11-06]: Visual Badges for Partial Trims & Locked Profits
+// ORIGINAL INTENT: renderPositions and renderTrades rendered plain tables without
+// showing trimmed share counts or distinguishing locked PARTIAL_TP legs from full exits.
+// REASON FOR CHANGE: Highlight real cash profits locked in from partial take-profit trims
+// in both Positions and Trades tabs.
+// SAFE ROLLBACK: Preserved previous functions below.
+// -----------------------------------------------------------------------------
+// [PREVIOUS CODE - PRESERVED]:
+// function renderPositions(positions) {
+//   const el = document.getElementById("tabContent");
+//   if (!positions.length) {
+//     el.innerHTML = '<div style="color:var(--muted); text-align:center; padding:35px; font-weight:600;">⚡ No open positions. AI trading engine is actively monitoring scanner signals.</div>';
+//     return;
+//   }
+//   el.innerHTML = `
+//     <table class="grid-tbl">
+//       <thead><tr><th>Symbol</th><th>Side</th><th class="r">Shares</th><th class="r">Entry Price</th><th class="r">Current Price</th><th class="r">Stop Loss</th><th class="r">Take Profit</th><th class="r">Unrealized P&L</th><th class="r">Action</th></tr></thead>
+//       <tbody>
+//         ${positions.map(p => `
+//           <tr>
+//             <td><b>${p.symbol}</b></td>
+//             <td><span class="side-tag buy">BUY</span></td>
+//             <td class="r num">${p.shares || 1}</td>
+//             <td class="r num">₹${(p.entry_price || 0).toLocaleString('en-IN', {minimumFractionDigits:2, maximumFractionDigits:2})}</td>
+//             <td class="r num">₹${(p.current_price || p.entry_price || 0).toLocaleString('en-IN', {minimumFractionDigits:2, maximumFractionDigits:2})}</td>
+//             <td class="r num" style="color:var(--red);">₹${(p.stop_loss || 0).toFixed(2)}</td>
+//             <td class="r num" style="color:var(--green);">₹${(p.take_profit || 0).toFixed(2)}</td>
+//             <td class="r num ${p.pnl_pct >= 0 ? 'pos' : 'neg'}"><b>${p.pnl_pct >= 0 ? '+' : ''}₹${(p.pnl_usd || 0).toFixed(2)}</b> (${p.pnl_pct >= 0 ? '+' : ''}${(p.pnl_pct || 0).toFixed(2)}%)</td>
+//             <td class="r"><button class="btn danger sm" onclick="closePosition('${p.symbol}')">Close</button></td>
+//           </tr>
+//         `).join('')}
+//       </tbody>
+//     </table>
+//   `;
+// }
+// -----------------------------------------------------------------------------
+// [NEW CODE]:
 function renderPositions(positions) {
   const el = document.getElementById("tabContent");
   if (!positions.length) {
@@ -2793,9 +2959,12 @@ function renderPositions(positions) {
       <tbody>
         ${positions.map(p => `
           <tr>
-            <td><b>${p.symbol}</b></td>
+            <td>
+              <b>${p.symbol}</b>
+              ${p.trim_shares > 0 ? `<span class="chip" style="background:rgba(46,213,115,0.18); color:var(--green); font-size:10px; font-weight:800; margin-left:6px;" title="Trimmed ${p.trim_shares} shares @ ₹${p.trim_price}">✂️ +₹${(p.trimmed_profit_usd || 0).toFixed(2)} booked</span>` : ''}
+            </td>
             <td><span class="side-tag buy">BUY</span></td>
-            <td class="r num">${p.shares || 1}</td>
+            <td class="r num">${p.shares}${p.trim_shares > 0 ? ` <span style="color:var(--muted); font-size:11px;" title="Remaining of initial ${p.initial_shares} shares">(${p.initial_shares})</span>` : ''}</td>
             <td class="r num">₹${(p.entry_price || 0).toLocaleString('en-IN', {minimumFractionDigits:2, maximumFractionDigits:2})}</td>
             <td class="r num">₹${(p.current_price || p.entry_price || 0).toLocaleString('en-IN', {minimumFractionDigits:2, maximumFractionDigits:2})}</td>
             <td class="r num" style="color:var(--red);">₹${(p.stop_loss || 0).toFixed(2)}</td>
@@ -2808,6 +2977,7 @@ function renderPositions(positions) {
     </table>
   `;
 }
+// =============================================================================
 
 function renderOrders() {
   const el = document.getElementById("tabContent");
@@ -2842,6 +3012,45 @@ function renderOrders() {
   });
 }
 
+// =============================================================================
+// [MODIFIED 2026-11-06]: Highlight Partial TP in Trades Tab
+// ORIGINAL INTENT: renderTrades rendered all entries uniformly without highlighting
+// active trimmed trades or distinguishing locked partial profit bookings.
+// REASON FOR CHANGE: Clearly indicate PARTIAL_TP (Locked Profit) rows with green chips
+// and distinct styling.
+// SAFE ROLLBACK: Preserved previous renderTrades implementation below.
+// -----------------------------------------------------------------------------
+// [PREVIOUS CODE - PRESERVED]:
+// function renderTrades() {
+//   const el = document.getElementById("tabContent");
+//   req("/api/trades").then(trades => {
+//     document.getElementById("trdCount").innerText = trades.length;
+//     if (!trades.length) {
+//       el.innerHTML = '<div style="color:var(--muted); text-align:center; padding:35px; font-weight:600;">No closed trades recorded yet.</div>';
+//       return;
+//     }
+//     el.innerHTML = `
+//       <table class="grid-tbl">
+//         <thead><tr><th>Exit Time</th><th>Symbol</th><th class="r">Entry Price</th><th class="r">Exit Price</th><th class="r">Realized P&L</th><th>Exit Reason</th><th>Forensic Attribution</th></tr></thead>
+//         <tbody>
+//           ${trades.map(t => `
+//             <tr>
+//               <td class="num" style="color:var(--muted);">${t.exit_time || '—'}</td>
+//               <td><b>${t.symbol}</b></td>
+//               <td class="r num">₹${(t.entry_price || 0).toFixed(2)}</td>
+//               <td class="r num">₹${(t.exit_price || 0).toFixed(2)}</td>
+//               <td class="r num ${t.pnl_usd >= 0 ? 'pos' : 'neg'}"><b>${t.pnl_usd >= 0 ? '+' : ''}₹${(t.pnl_usd || 0).toFixed(2)}</b> (${t.pnl_pct >= 0 ? '+' : ''}${(t.pnl_pct || 0).toFixed(2)}%)</td>
+//               <td><span class="chip">${t.exit_reason || 'CLOSED'}</span></td>
+//               <td><span class="chip" style="color:var(--accent); font-weight:800;">${t.attribution || 'TECHNICAL_STOP'}</span></td>
+//             </tr>
+//           `).join('')}
+//         </tbody>
+//       </table>
+//     `;
+//   });
+// }
+// -----------------------------------------------------------------------------
+// [NEW CODE]:
 function renderTrades() {
   const el = document.getElementById("tabContent");
   req("/api/trades").then(trades => {
@@ -2855,13 +3064,16 @@ function renderTrades() {
         <thead><tr><th>Exit Time</th><th>Symbol</th><th class="r">Entry Price</th><th class="r">Exit Price</th><th class="r">Realized P&L</th><th>Exit Reason</th><th>Forensic Attribution</th></tr></thead>
         <tbody>
           ${trades.map(t => `
-            <tr>
+            <tr ${t.is_trim ? 'style="background:rgba(46,213,115,0.04);"' : ''}>
               <td class="num" style="color:var(--muted);">${t.exit_time || '—'}</td>
-              <td><b>${t.symbol}</b></td>
+              <td>
+                <b>${t.symbol}</b>
+                ${t.is_trim ? '<span style="color:var(--green); font-size:10px; font-weight:700; margin-left:4px;">[RUNNER ACTIVE]</span>' : ''}
+              </td>
               <td class="r num">₹${(t.entry_price || 0).toFixed(2)}</td>
               <td class="r num">₹${(t.exit_price || 0).toFixed(2)}</td>
               <td class="r num ${t.pnl_usd >= 0 ? 'pos' : 'neg'}"><b>${t.pnl_usd >= 0 ? '+' : ''}₹${(t.pnl_usd || 0).toFixed(2)}</b> (${t.pnl_pct >= 0 ? '+' : ''}${(t.pnl_pct || 0).toFixed(2)}%)</td>
-              <td><span class="chip">${t.exit_reason || 'CLOSED'}</span></td>
+              <td><span class="chip" ${t.is_trim ? 'style="background:rgba(46,213,115,0.2); color:var(--green); font-weight:800; border:1px solid rgba(46,213,115,0.4);"' : ''}>${t.exit_reason || 'CLOSED'}</span></td>
               <td><span class="chip" style="color:var(--accent); font-weight:800;">${t.attribution || 'TECHNICAL_STOP'}</span></td>
             </tr>
           `).join('')}
@@ -2870,6 +3082,7 @@ function renderTrades() {
     `;
   });
 }
+// =============================================================================
 
 function renderSelfHealing(sh) {
   const el = document.getElementById("tabContent");
