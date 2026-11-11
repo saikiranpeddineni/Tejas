@@ -214,12 +214,28 @@ def _restore_open_trades(portfolio: Portfolio) -> None:
                 rationale=row["rationale"] or "",
             )
             portfolio.open_trades.append(trade)
-            # ★ Rebuild sector exposure — without this the sector caps saw an
-            # empty book after every restart and approved ~2x the sector limit.
+            # =============================================================================
+            # [MODIFIED 2026-11-11]: Rebuild sector exposure using active size (accounting for trims)
+            # ORIGINAL INTENT: Added static initial trade.size_usd to sector_exposure.
+            # REASON FOR CHANGE: If a trade was trimmed at first target, adding initial size_usd
+            # inflates sector exposure by phantom capital, blocking new entries in that sector.
+            # SAFE ROLLBACK: Preserved original code below as comments.
+            # -----------------------------------------------------------------------------
+            # [PREVIOUS CODE - PRESERVED]:
+            # # ★ Rebuild sector exposure — without this the sector caps saw an
+            # # empty book after every restart and approved ~2x the sector limit.
+            # from dynamic_risk import _SECTOR_NAMES
+            # sector = _SECTOR_NAMES.get(trade.features.sector_code, "other")
+            # portfolio.sector_exposure[sector] = (
+            #     portfolio.sector_exposure.get(sector, 0.0) + trade.size_usd)
+            # -----------------------------------------------------------------------------
+            # [NEW CODE]:
             from dynamic_risk import _SECTOR_NAMES
             sector = _SECTOR_NAMES.get(trade.features.sector_code, "other")
+            active_size = getattr(trade, "active_size_usd", trade.size_usd)
             portfolio.sector_exposure[sector] = (
-                portfolio.sector_exposure.get(sector, 0.0) + trade.size_usd)
+                portfolio.sector_exposure.get(sector, 0.0) + active_size)
+            # =============================================================================
             restored += 1
             log.info(
                 f"[Main] Restored: {trade.symbol} ₹{trade.size_usd:.2f} "
@@ -992,11 +1008,32 @@ def main() -> None:
                     # ── ★ Staged exit: trim at first target, position stays open ──
                     if reason == "PARTIAL_TP":
                         if exec_e.trim_trade(trade, exit_price):
+                            # =============================================================================
+                            # [MODIFIED 2026-11-11]: Update sector exposure on successful partial trim
+                            # ORIGINAL INTENT: Only logged and alerted without updating sector_exposure.
+                            # REASON FOR CHANGE: When half the shares are sold, sector exposure must be
+                            # decremented by the trimmed value so new opportunities in that sector can enter.
+                            # SAFE ROLLBACK: Preserved original code below as comments.
+                            # -----------------------------------------------------------------------------
+                            # [PREVIOUS CODE - PRESERVED]:
+                            # telegram_alerts.alert_partial_tp(trade)
+                            # log.info(
+                            #     f"[Main] ✂️ TRIM {trade.symbol} at {pnl_pct:+.2%} — "
+                            #     f"half booked, rest rides to TP with breakeven stop"
+                            # )
+                            # -----------------------------------------------------------------------------
+                            # [NEW CODE]:
+                            from dynamic_risk import _SECTOR_NAMES
+                            sector = _SECTOR_NAMES.get(trade.features.sector_code, "other")
+                            trimmed_val = float(trade.trim_shares or 0.0) * float(trade.entry_price or 0.0)
+                            if trimmed_val > 0 and sector in portfolio.sector_exposure:
+                                portfolio.sector_exposure[sector] = max(0.0, portfolio.sector_exposure[sector] - trimmed_val)
                             telegram_alerts.alert_partial_tp(trade)
                             log.info(
                                 f"[Main] ✂️ TRIM {trade.symbol} at {pnl_pct:+.2%} — "
                                 f"half booked, rest rides to TP with breakeven stop"
                             )
+                            # =============================================================================
                         else:
                             # Can't trim (1-share position / unsupported broker):
                             # mark so the trigger doesn't refire every cycle.

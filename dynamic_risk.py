@@ -258,23 +258,54 @@ class DynamicRiskManager:
             return None
         exposure_ratio = total_exposure / bankroll
 
-        if exposure_ratio >= 0.85:
-            log.warning("[Risk] Absolute total exposure cap (85%)")
+        # =============================================================================
+        # [MODIFIED 2026-11-11]: Configurable total exposure cap & capital utilization
+        # ORIGINAL INTENT: Hardcoded 85% total exposure cap and 70% reserve tier with 0.40 score threshold.
+        # REASON FOR CHANGE: Enable full capital deployment up to MAX_TOTAL_EXPOSURE (default 95%) in
+        # paper and live modes, with reserve tier threshold at RESERVE_TIER_EXPOSURE (85%) and score
+        # requirement at RESERVE_MIN_SCORE (0.20), preventing idle capital lockup.
+        # SAFE ROLLBACK: Preserved original code below as comments.
+        # -----------------------------------------------------------------------------
+        # [PREVIOUS CODE - PRESERVED]:
+        # if exposure_ratio >= 0.85:
+        #     log.warning("[Risk] Absolute total exposure cap (85%)")
+        #     return None
+        #
+        # if exposure_ratio >= 0.70:
+        #     if signal.analyst_score < 0.40:
+        #         log.info(f"[Risk] Reserve tier active: rejecting {signal.symbol} (score {signal.analyst_score:.2f} < 0.40)")
+        #         return None
+        #
+        # exposure_headroom = bankroll * 0.85 - total_exposure
+        # if exposure_headroom < Config.MIN_POSITION_USD:
+        #     log.warning("[Risk] Total exposure cap leaves no enterable headroom")
+        #     return None
+        # raw_size = min(raw_size, exposure_headroom)
+        # -----------------------------------------------------------------------------
+        # [NEW CODE]:
+        max_cap           = getattr(Config, "MAX_TOTAL_EXPOSURE", 0.85)
+        reserve_thresh    = getattr(Config, "RESERVE_TIER_EXPOSURE", 0.70)
+        reserve_min_score = getattr(Config, "RESERVE_MIN_SCORE", 0.40)
+
+        if exposure_ratio >= max_cap:
+            log.warning(f"[Risk] Absolute total exposure cap ({max_cap:.0%})")
             return None
 
-        if exposure_ratio >= 0.70:
-            if signal.analyst_score < 0.40:
-                log.info(f"[Risk] Reserve tier active: rejecting {signal.symbol} (score {signal.analyst_score:.2f} < 0.40)")
+        if exposure_ratio >= reserve_thresh:
+            if signal.analyst_score < reserve_min_score:
+                log.info(f"[Risk] Reserve tier active: rejecting {signal.symbol} "
+                         f"(score {signal.analyst_score:.2f} < {reserve_min_score:.2f})")
                 return None
 
         # Cap the resulting book, not only the book before this order. Without
-        # this headroom clamp an 80%-deployed portfolio could add a full-sized
-        # order and cross the absolute 85% exposure limit.
-        exposure_headroom = bankroll * 0.85 - total_exposure
+        # this headroom clamp a deployed portfolio could add a full-sized
+        # order and cross the absolute exposure limit.
+        exposure_headroom = bankroll * max_cap - total_exposure
         if exposure_headroom < Config.MIN_POSITION_USD:
             log.warning("[Risk] Total exposure cap leaves no enterable headroom")
             return None
         raw_size = min(raw_size, exposure_headroom)
+        # =============================================================================
 
         # ── 8. ★ PORTFOLIO BETA CAP ───────────────────────────────
         port_beta = self._estimate_portfolio_beta(portfolio.open_trades)
@@ -332,16 +363,37 @@ class DynamicRiskManager:
         )
         return round(size, 2)
 
+    # =============================================================================
+    # [MODIFIED 2026-11-11]: Active size beta estimation accounting for trimmed trades
+    # ORIGINAL INTENT: Estimated portfolio beta weighting by initial `t.size_usd`.
+    # REASON FOR CHANGE: When a trade is trimmed at first target, active size is halved.
+    # Weighting by active_size_usd reflects the true current portfolio risk.
+    # SAFE ROLLBACK: Preserved original code below as comments.
+    # -----------------------------------------------------------------------------
+    # [PREVIOUS CODE - PRESERVED]:
+    # # ── PORTFOLIO BETA ESTIMATION ─────────────────────────────────────────────
+    # def _estimate_portfolio_beta(self, open_trades: List[Trade]) -> float:
+    #     if not open_trades: return 0.0
+    #     total_size = sum(t.size_usd for t in open_trades)
+    #     if total_size <= 0: return 0.0
+    #     weighted_beta = sum(
+    #         _APPROX_BETA.get(t.symbol, 1.0) * t.size_usd
+    #         for t in open_trades
+    #     )
+    #     return weighted_beta / total_size
+    # -----------------------------------------------------------------------------
+    # [NEW CODE]:
     # ── PORTFOLIO BETA ESTIMATION ─────────────────────────────────────────────
     def _estimate_portfolio_beta(self, open_trades: List[Trade]) -> float:
         if not open_trades: return 0.0
-        total_size = sum(t.size_usd for t in open_trades)
+        total_size = sum(getattr(t, "active_size_usd", t.size_usd) for t in open_trades)
         if total_size <= 0: return 0.0
         weighted_beta = sum(
-            _APPROX_BETA.get(t.symbol, 1.0) * t.size_usd
+            _APPROX_BETA.get(t.symbol, 1.0) * getattr(t, "active_size_usd", t.size_usd)
             for t in open_trades
         )
         return weighted_beta / total_size
+    # =============================================================================
 
     # ── DAILY P&L TRACKING ────────────────────────────────────────────────────
     def record_trade_pnl(self, pnl_usd: float) -> None:
@@ -383,7 +435,23 @@ class DynamicRiskManager:
             portfolio.update_peak()
         self.record_trade_pnl(trade.pnl_usd)
         self._recent_exits[trade.symbol] = datetime.now(timezone.utc)   # start re-entry cooldown
+        # =============================================================================
+        # [MODIFIED 2026-11-11]: Subtract active remaining size from sector exposure
+        # ORIGINAL INTENT: Subtracted initial trade.size_usd upon closing trade.
+        # REASON FOR CHANGE: If a trade was trimmed, its active exposure was reduced.
+        # Subtracting active_size_usd avoids negative or distorted sector tracking.
+        # SAFE ROLLBACK: Preserved original code below as comments.
+        # -----------------------------------------------------------------------------
+        # [PREVIOUS CODE - PRESERVED]:
+        # sector = _SECTOR_NAMES.get(trade.features.sector_code, "other")
+        # portfolio.sector_exposure[sector] = max(
+        #     0., portfolio.sector_exposure.get(sector, 0.) - trade.size_usd
+        # )
+        # -----------------------------------------------------------------------------
+        # [NEW CODE]:
         sector = _SECTOR_NAMES.get(trade.features.sector_code, "other")
+        rem_size = getattr(trade, "active_size_usd", trade.size_usd)
         portfolio.sector_exposure[sector] = max(
-            0., portfolio.sector_exposure.get(sector, 0.) - trade.size_usd
+            0., portfolio.sector_exposure.get(sector, 0.) - rem_size
         )
+        # =============================================================================

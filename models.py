@@ -217,6 +217,36 @@ class Trade:
     trim_price:        Optional[float]    = None   # fill price of the trim
     rationale:         str                = ""     # entry WHY (from Signal)
 
+    # =============================================================================
+    # [MODIFIED 2026-11-11]: Active shares and exposure properties for partial trims
+    # ORIGINAL INTENT: Trade only tracked static initial `shares` and `size_usd`.
+    # REASON FOR CHANGE: When a trade is trimmed at first target, `trim_shares` are sold
+    # at the broker and capital is returned to cash. To prevent phantom exposure from
+    # artificially locking up portfolio capacity and starving new entries, `active_shares`
+    # and `active_size_usd` calculate the true remaining capital deployed in the market.
+    # SAFE ROLLBACK: Preserved original fields above; properties default safely to size_usd.
+    # -----------------------------------------------------------------------------
+    # [NEW CODE]:
+    @property
+    def active_shares(self) -> float:
+        # Shares currently held, accounting for partial first-target trims
+        if self.status != "open":
+            return 0.0
+        return max(0.0, float(self.shares or 0.0) - max(0.0, float(self.trim_shares or 0.0)))
+
+    @property
+    def active_size_usd(self) -> float:
+        # Active capital committed to this trade, accounting for partial first-target trims
+        if self.status != "open":
+            return 0.0
+        total_s = float(self.shares or 0.0)
+        trimmed_s = float(self.trim_shares or 0.0)
+        if total_s > 0 and trimmed_s > 0:
+            frac = max(0.0, 1.0 - (trimmed_s / total_s))
+            return float(self.size_usd or 0.0) * frac
+        return float(self.size_usd or 0.0)
+    # =============================================================================
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PORTFOLIO
@@ -239,9 +269,24 @@ class Portfolio:
             return 0.0
         return max(0.0, (self.peak_bankroll - self.bankroll) / self.peak_bankroll)
 
+    # =============================================================================
+    # [MODIFIED 2026-11-11]: Accurate active exposure accounting for trimmed trades
+    # ORIGINAL INTENT: total_exposure was sum(t.size_usd for t in self.open_trades).
+    # REASON FOR CHANGE: After a first-target trim, size_usd retained the initial full
+    # order size, locking up phantom capital and falsely triggering the 70% reserve tier.
+    # We now sum `t.active_size_usd` so trimmed capital is released for new trades.
+    # SAFE ROLLBACK: Preserved original code below as comments.
+    # -----------------------------------------------------------------------------
+    # [PREVIOUS CODE - PRESERVED]:
+    # @property
+    # def total_exposure(self) -> float:
+    #     return sum(t.size_usd for t in self.open_trades)
+    # -----------------------------------------------------------------------------
+    # [NEW CODE]:
     @property
     def total_exposure(self) -> float:
-        return sum(t.size_usd for t in self.open_trades)
+        return sum(t.active_size_usd for t in self.open_trades)
+    # =============================================================================
 
     @property
     def available_capital(self) -> float:

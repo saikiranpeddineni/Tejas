@@ -408,11 +408,27 @@ def start_bot(opts: dict, source: str = "ui") -> dict:
         and os.environ.get("LIVE_AUTOSTART_ACK", "").strip()
             == Config.LIVE_AUTOSTART_ACK_TEXT
     )
+    # =============================================================================
+    # [MODIFIED 2026-11-11]: Auto-start defaults to Paper Mode (not Demo)
+    # ORIGINAL INTENT: Auto-start without live credentials downgraded to dry_run=True (demo).
+    # REASON FOR CHANGE: User directive: bot must open and run in Paper Mode (real fills
+    # against simulated broker book), not Demo mode (observation only), for prod-grade testing.
+    # SAFE ROLLBACK: Preserved original code below as comments.
+    # -----------------------------------------------------------------------------
+    # [PREVIOUS CODE - PRESERVED]:
+    # if source == "auto" and not auto_live and broker != "simulated":
+    #     broker = "simulated"
+    #     dry_run = True
+    #     ignore_hours = False
+    #     requested_live = False
+    # -----------------------------------------------------------------------------
+    # [NEW CODE]:
     if source == "auto" and not auto_live and broker != "simulated":
         broker = "simulated"
-        dry_run = True
+        dry_run = (mode_req == "demo")   # True only if user explicitly chose Demo; otherwise False (Paper)
         ignore_hours = False
         requested_live = False
+    # =============================================================================
 
     with _proc_lock:
         if bot_proc and bot_proc.poll() is None:
@@ -554,9 +570,28 @@ def start_bot(opts: dict, source: str = "ui") -> dict:
             # for the status() fallback, even when the bot is auto-started by the supervisor.
             # SAFE ROLLBACK: Remove this elif block entirely.
             # -----------------------------------------------------------------------------
-            opts["bankroll"] = env["BANKROLL"]
-            opts["scan"]     = env["SCAN_INTERVAL_SECONDS"]
+            # =============================================================================
+            # [MODIFIED 2026-11-11]: Persist resolved mode and broker on auto-start
+            # ORIGINAL INTENT: Only persisted bankroll and scan, leaving mode as null/stale.
+            # REASON FOR CHANGE: Ensure autostart.local.json always explicitly saves
+            # mode="paper", broker="simulated", dry_run=False so reboots never revert to demo.
+            # SAFE ROLLBACK: Preserved original code below as comments.
+            # -----------------------------------------------------------------------------
+            # [PREVIOUS CODE - PRESERVED]:
+            # opts["bankroll"] = env["BANKROLL"]
+            # opts["scan"]     = env["SCAN_INTERVAL_SECONDS"]
+            # save_autostart_opts(opts)
+            # -----------------------------------------------------------------------------
+            # [NEW CODE]:
+            resolved_mode = "demo" if dry_run else ("paper" if broker == "simulated" else "live")
+            opts["mode"]         = resolved_mode
+            opts["broker"]       = broker
+            opts["dry_run"]      = dry_run
+            opts["ignore_hours"] = ignore_hours
+            opts["bankroll"]     = env["BANKROLL"]
+            opts["scan"]         = env["SCAN_INTERVAL_SECONDS"]
             save_autostart_opts(opts)
+            # =============================================================================
             # =============================================================================
         return {"ok": True, "pid": bot_proc.pid}
 
@@ -1409,6 +1444,24 @@ def status() -> dict:
     positions = open_positions()
     self_healing_data = get_self_healing_status()
 
+    # =============================================================================
+    # [MODIFIED 2026-11-11]: Accurate dynamic uninvested cash calculation
+    # ORIGINAL INTENT: Used hardcoded placeholder `round(cur_equity * 0.75, 2)`.
+    # REASON FOR CHANGE: Telemetry and dashboard must reflect actual liquid buying power
+    # and uninvested capital (equity minus current market value of open positions).
+    # SAFE ROLLBACK: Preserved original code below as comments.
+    # -----------------------------------------------------------------------------
+    # [PREVIOUS CODE - PRESERVED]:
+    # # "cash": round(cur_equity * 0.75, 2),
+    # -----------------------------------------------------------------------------
+    # [NEW CODE]:
+    pos_market_val = sum(
+        float(p.get("shares", 0.0) or 0.0) * float(p.get("current_price", 0.0) or p.get("entry_price", 0.0) or 0.0)
+        for p in positions
+    )
+    actual_cash = max(0.0, cur_equity - pos_market_val)
+    # =============================================================================
+
     return {
         # AlphaBot Contract Keys
         "state": state,
@@ -1421,7 +1474,7 @@ def status() -> dict:
         },
         "account": {
             "equity": round(cur_equity, 2),
-            "cash": round(cur_equity * 0.75, 2),
+            "cash": round(actual_cash, 2),
             "day_pnl": round(run_pnl, 2),
             "day_pnl_pct": round(run_pct, 2),
             "drawdown_pct": round(dd or 0.0, 1),

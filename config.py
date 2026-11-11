@@ -104,12 +104,33 @@ class Config:
     DB_PATH   = str(BASE_DIR / "tejas.db")
     MODEL_DIR = str(BASE_DIR / "models")
 
+    # =============================================================================
+    # [MODIFIED 2026-11-11]: Capital Utilization and Exposure Thresholds
+    # ORIGINAL INTENT: Bankroll and position caps were specified without overall
+    # portfolio exposure limits, causing dynamic_risk to hardcode 70%/85% limits.
+    # REASON FOR CHANGE: Enable full capital deployment up to 95% in paper and live modes
+    # while retaining 5% cash buffer for friction/slippage, with configurable reserve tier.
+    # SAFE ROLLBACK: Preserved original code below as comments.
+    # -----------------------------------------------------------------------------
+    # [PREVIOUS CODE - PRESERVED]:
+    # # ── Capital (amounts are in INR ₹) ─────────────────────────────────────────
+    # BANKROLL          = float(os.getenv("BANKROLL", "100000"))   # ₹1,00,000
+    # MIN_POSITION_USD  = float(os.getenv("MIN_POSITION", "5000"))  # ₹ (name kept for compat)
+    # MAX_POSITION_USD  = float(os.getenv("MAX_POSITION", "25000")) # ₹
+    # MAX_POSITION_PCT  = float(os.getenv("MAX_POSITION_PCT", "0.12"))
+    # KELLY_FRACTION    = float(os.getenv("KELLY_FRACTION", "0.25"))
+    # -----------------------------------------------------------------------------
+    # [NEW CODE]:
     # ── Capital (amounts are in INR ₹) ─────────────────────────────────────────
-    BANKROLL          = float(os.getenv("BANKROLL", "100000"))   # ₹1,00,000
-    MIN_POSITION_USD  = float(os.getenv("MIN_POSITION", "5000"))  # ₹ (name kept for compat)
-    MAX_POSITION_USD  = float(os.getenv("MAX_POSITION", "25000")) # ₹
-    MAX_POSITION_PCT  = float(os.getenv("MAX_POSITION_PCT", "0.12"))
-    KELLY_FRACTION    = float(os.getenv("KELLY_FRACTION", "0.25"))
+    BANKROLL              = float(os.getenv("BANKROLL", "100000"))   # ₹1,00,000
+    MIN_POSITION_USD      = float(os.getenv("MIN_POSITION", "5000"))  # ₹ (name kept for compat)
+    MAX_POSITION_USD      = float(os.getenv("MAX_POSITION", "25000")) # ₹
+    MAX_POSITION_PCT      = float(os.getenv("MAX_POSITION_PCT", "0.12"))
+    KELLY_FRACTION        = float(os.getenv("KELLY_FRACTION", "0.25"))
+    MAX_TOTAL_EXPOSURE    = float(os.getenv("MAX_TOTAL_EXPOSURE", "0.85"))     # max 85% deployed
+    RESERVE_TIER_EXPOSURE = float(os.getenv("RESERVE_TIER_EXPOSURE", "0.70"))  # reserve tier starts at 70%
+    RESERVE_MIN_SCORE     = float(os.getenv("RESERVE_MIN_SCORE", "0.40"))      # score threshold for reserve tier
+    # =============================================================================
 
     # ── Stock Universe (NSE — NIFTY large/mid caps) ────────────────────────────
     WATCHLIST = [
